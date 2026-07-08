@@ -30,8 +30,11 @@ final class LocalMLXChatSession: CommandLLMClient, @unchecked Sendable {
         try start(systemPrompt: systemPrompt)
     }
 
-    func complete(systemPrompt: String, userPrompt: String) async throws -> String {
-        try run(systemPrompt: systemPrompt, userPrompt: userPrompt)
+    func complete(systemPrompt: String, userPrompt: String, imageURLs: [URL]) async throws -> String {
+        if !imageURLs.isEmpty {
+            log("local MLX image context ignored (\(imageURLs.count) image(s))")
+        }
+        return try run(systemPrompt: systemPrompt, userPrompt: userPrompt)
     }
 
     func start(systemPrompt: String) throws {

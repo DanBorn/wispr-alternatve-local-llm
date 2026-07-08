@@ -38,6 +38,7 @@ def main() -> int:
     assert_true(help_output.returncode == 0, "help command failed")
     for expected in ["setup [--config PATH]", "config [show|doctor|reset]", "config doctor", "config reset --yes"]:
         assert_true(expected in help_output.stdout, f"help output missing {expected!r}")
+    assert_true("--test-command-image PATH" in help_output.stdout, "help output must expose image context test input")
 
     checked_in_config = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
     assert_true("api_key" not in checked_in_config.get("local_llm", {}), "checked-in config must not store api_key")
@@ -46,6 +47,8 @@ def main() -> int:
     assert_true("let stableDuration: TimeInterval = 0.35" in wizard_source, "shortcut capture must wait for a stable shortcut")
     assert_true("Simple Setup (recommended)" in wizard_source, "setup wizard must expose Simple Setup")
     assert_true("Advanced Setup" in wizard_source, "setup wizard must expose Advanced Setup")
+    assert_true("Transcription language" in wizard_source, "setup wizard must expose ASR language onboarding")
+    assert_true("System Language" in wizard_source, "setup wizard must default ASR language to system")
     assert_true("Enable Hermes Agent?" in wizard_source, "advanced setup wizard must expose Hermes Agent onboarding")
     assert_true("Enable Bluetooth keyboard output?" in wizard_source, "advanced setup wizard must expose Bluetooth onboarding")
     assert_true("hermesTriggerSummary" in wizard_source, "setup wizard must explain the Hermes trigger")
@@ -68,6 +71,12 @@ def main() -> int:
     ]:
         assert_true(forbidden not in wizard_source, f"wizard source must not contain German prompt fragment {forbidden!r}")
     options_source = (REPO_ROOT / "app" / "Sources" / "CLI" / "Options.swift").read_text(encoding="utf-8")
+    app_config_source = (REPO_ROOT / "app" / "Sources" / "Config" / "AppConfig.swift").read_text(encoding="utf-8")
+    assert_true("case cerebras" in app_config_source, "local LLM config must support provider=cerebras")
+    assert_true("imageContextEnabled" in app_config_source, "local LLM config must support image context toggle")
+    llm_client_source = (REPO_ROOT / "app" / "Sources" / "LocalLLM" / "AzureOpenAICommandLLMClient.swift").read_text(encoding="utf-8")
+    assert_true("case topP = \"top_p\"" in llm_client_source, "chat completions requests must support Cerebras top_p")
+    assert_true("imageURL = \"image_url\"" in llm_client_source, "chat completions requests must support image_url parts")
     assert_true(
         "options.testCommandInformation != nil || options.testCommand != nil" in options_source,
         "missing API keys must not abort normal dictation startup",
@@ -84,11 +93,13 @@ def main() -> int:
         assert_true(setup.returncode == 0, "setup wizard failed with empty token")
         assert_true("Simple Setup (recommended)" in setup.stdout, "setup must show Simple Setup")
         assert_true("Advanced Setup" in setup.stdout, "setup must show Advanced Setup")
+        assert_true("Transcription language" in setup.stdout, "setup must ask for ASR language")
         assert_true("Selection [1] (q to quit):" in setup.stdout, "setup must use the English selection prompt")
         assert_true("Bluetooth" not in setup.stdout, "simple setup must not mention Bluetooth")
         assert_true("Hermes" not in setup.stdout, "simple setup must not mention Hermes")
         assert_true((Path(temp_dir) / ".env").exists(), "setup must create .env even when token is empty")
         simple_config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert_true(simple_config["asr"]["language"] == "system", "simple setup must default ASR language to system")
         assert_true(
             simple_config["hermes_agent"]["enabled"] is False,
             "simple setup must disable Hermes Agent",
@@ -112,6 +123,10 @@ def main() -> int:
         assert_true(
             simple_config["llm_output"]["bluetooth"] == "clipboard",
             "simple setup must leave Bluetooth output local",
+        )
+        assert_true(
+            simple_config["local_llm"]["image_context_enabled"] is False,
+            "simple setup must keep image context disabled for generic OpenAI-compatible defaults",
         )
         assert_true(
             simple_config["llm_output"]["dump"] == "clipboard",
@@ -141,6 +156,7 @@ def main() -> int:
         reset = run_command(["config", "reset", "--yes", "--config", str(config_path)])
         assert_true(reset.returncode == 0, "config reset failed")
         reset_config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert_true(reset_config["asr"]["language"] == "system", "config reset must default ASR language to system")
         assert_true("api_key" not in reset_config.get("local_llm", {}), "config reset must not write api_key")
         assert_true(reset_config["local_llm"]["api_key_env"] == "OPENAI_API_KEY", "config reset must use OPENAI_API_KEY")
         assert_true(reset_config["hermes_agent"]["enabled"] is False, "config reset must disable Hermes by default")
@@ -159,11 +175,12 @@ def main() -> int:
         dotenv_path = Path(temp_dir) / ".env"
         dotenv_path.write_text("OTHER_SECRET=keep-me\nOPENAI_API_KEY=old\n", encoding="utf-8")
 
-        setup_input = "\n\n\n\nsk-new-secret-1234\n\n\n"
+        setup_input = "\n\n\n\n\nsk-new-secret-1234\n\n\n"
         setup = run_command(["setup", "--config", str(config_path)], input_text=setup_input)
         assert_true(setup.returncode == 0, "setup wizard failed")
         config = json.loads(config_path.read_text(encoding="utf-8"))
         local_llm = config["local_llm"]
+        assert_true(config["asr"]["language"] == "system", "default setup must use system ASR language")
         assert_true(local_llm["provider"] == "openai_compatible", "default setup must use OpenAI-compatible provider")
         assert_true(local_llm["base_url"] == "https://api.openai.com/v1", "default setup must use OpenAI base URL")
         assert_true(local_llm["api_key_env"] == "OPENAI_API_KEY", "default setup must use generic OPENAI_API_KEY")

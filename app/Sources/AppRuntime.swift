@@ -313,12 +313,14 @@ actor FluidTranscriber {
     private var language: Language?
     private let minimumTranscribableFrames: AVAudioFramePosition = 3_200
 
-    func prepare(modelVersion: String, language: String) async throws {
-        self.language = language == "auto" ? nil : Language(rawValue: language)
+    func prepare(modelVersion: String, language: String) async throws -> AsrLanguageResolution {
+        let resolution = AsrLanguageResolver.resolve(language)
+        self.language = resolution.language
         let version: AsrModelVersion = modelVersion == "v2" ? .v2 : .v3
         let models = try await AsrModels.downloadAndLoad(version: version)
         try await manager.loadModels(models)
         decoderState = TdtDecoderState.make()
+        return resolution
     }
 
     func transcribe(url: URL) async throws -> String {
@@ -514,11 +516,11 @@ final class PushToTalkController: @unchecked Sendable {
                 recordingState = .idle
                 stopAndTranscribe(action: activeAction)
             }
-        case let .recordingInstruction(activeAction, informationURL):
+        case let .recordingInstruction(activeAction, informationURL, imageURL):
             cancelPendingContinuation()
             if !options.config.hotkeys.isContinuationPressed(for: activeAction, in: flags) {
                 recordingState = .idle
-                stopAndGenerateCommandResult(action: activeAction, informationURL: informationURL)
+                stopAndGenerateCommandResult(action: activeAction, informationURL: informationURL, imageURL: imageURL)
             }
         case let .recordingHermesInstruction(informationURL, screenshotURL):
             cancelPendingContinuation()
@@ -637,11 +639,13 @@ final class PushToTalkController: @unchecked Sendable {
             return
         }
         addAudioDuration(from: informationURL, label: "information")
+        let imageURL = captureCommandImageContext()
         do {
             try recorder.start()
             recordingState = .recordingInstruction(
                 action: activeAction,
-                informationURL: informationURL
+                informationURL: informationURL,
+                imageURL: imageURL
             )
             log("recording command...")
         } catch {
@@ -650,6 +654,7 @@ final class PushToTalkController: @unchecked Sendable {
             resetDeliveryTiming()
             fputs("recording failed: \(error)\n", stderr)
             try? preserveOrDeleteRecording(informationURL)
+            try? removeScreenContext(imageURL)
         }
     }
 
@@ -787,13 +792,16 @@ final class PushToTalkController: @unchecked Sendable {
         }
     }
 
-    private func stopAndGenerateCommandResult(action: HotkeyAction, informationURL: URL) {
+    private func stopAndGenerateCommandResult(action: HotkeyAction, informationURL: URL, imageURL: URL?) {
         guard let commandURL = recorder.stop() else {
             endAudioDuckingIfNeeded()
             let timing = deliveryTimingSnapshot()
             transcribing = true
             log("no command recording found; transcribing information...")
             Task {
+                defer {
+                    try? removeScreenContext(imageURL)
+                }
                 let information = await transcribeSegment(url: informationURL, label: "information")
                 await deliverInformationFallback(information, action: action, timing: timing)
                 try? preserveOrDeleteRecording(informationURL)
@@ -812,6 +820,9 @@ final class PushToTalkController: @unchecked Sendable {
         log("transcribing information and command...")
 
         Task {
+            defer {
+                try? removeScreenContext(imageURL)
+            }
             let information = await transcribeSegment(url: informationURL, label: "information")
             let command = await transcribeSegment(url: commandURL, label: "command")
 
@@ -822,7 +833,8 @@ final class PushToTalkController: @unchecked Sendable {
                 do {
                     let result = try await commandGenerator.generate(
                         information: information,
-                        command: command
+                        command: command,
+                        imageURLs: imageURL.map { [$0] } ?? []
                     )
                     if !result.isEmpty {
                         try await deliverResult(result, action: action, timing: timing)
@@ -850,16 +862,27 @@ final class PushToTalkController: @unchecked Sendable {
         }
     }
 
+    private func captureCommandImageContext() -> URL? {
+        guard options.config.localLLM.imageContextEnabled else {
+            return nil
+        }
+        return captureScreenContext(label: "command LLM image context", filePrefix: "command-context")
+    }
+
     private func captureHermesScreenContext() -> URL? {
+        captureScreenContext(label: "Hermes screenshot", filePrefix: "hermes-screen")
+    }
+
+    private func captureScreenContext(label: String, filePrefix: String) -> URL? {
         let permissionGranted: Bool
         if CGPreflightScreenCaptureAccess() {
             permissionGranted = true
         } else {
-            log("Hermes screenshot: requesting Screen Recording permission")
+            log("\(label): requesting Screen Recording permission")
             permissionGranted = CGRequestScreenCaptureAccess()
         }
         guard permissionGranted else {
-            fputs("Hermes screenshot unavailable: Screen Recording permission denied. Grant this app access in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch.\n", stderr)
+            fputs("\(label) unavailable: Screen Recording permission denied. Grant this app access in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch.\n", stderr)
             return nil
         }
 
@@ -869,19 +892,19 @@ final class PushToTalkController: @unchecked Sendable {
             kCGNullWindowID,
             [.bestResolution, .boundsIgnoreFraming]
         ) else {
-            fputs("Hermes screenshot unavailable: CGWindowListCreateImage returned nil\n", stderr)
+            fputs("\(label) unavailable: CGWindowListCreateImage returned nil\n", stderr)
             return nil
         }
 
         let dir = URL(fileURLWithPath: "~/Library/Application Support/fluid-push-to-talk/screenshots".expandingTilde, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let url = dir.appendingPathComponent("hermes-screen-\(Self.screenshotTimestamp()).png")
+            let url = dir.appendingPathComponent("\(filePrefix)-\(Self.screenshotTimestamp()).png")
             try writePNG(image: image, to: url)
-            log("Hermes screenshot captured: \(url.path)")
+            log("\(label) captured: \(url.path)")
             return url
         } catch {
-            fputs("Hermes screenshot unavailable: \(error)\n", stderr)
+            fputs("\(label) unavailable: \(error)\n", stderr)
             return nil
         }
     }
@@ -907,9 +930,13 @@ final class PushToTalkController: @unchecked Sendable {
         }
     }
 
-    private func removeHermesScreenshot(_ url: URL?) throws {
+    private func removeScreenContext(_ url: URL?) throws {
         guard let url else { return }
         try? FileManager.default.removeItem(at: url)
+    }
+
+    private func removeHermesScreenshot(_ url: URL?) throws {
+        try removeScreenContext(url)
     }
 
     private func stopAndRunHermesAgent(informationURL: URL, screenshotURL: URL?) {
@@ -1710,7 +1737,12 @@ struct FluidPushToTalk {
         do {
             let llmClient = CommandLLMClientFactory.make(config: options.config.localLLM)
             let generator = CommandResultGenerator(config: options.config, llmClient: llmClient)
-            let result = try await generator.generate(information: information, command: command)
+            let imageURLs = options.testCommandImage.map { [$0] } ?? []
+            let result = try await generator.generate(
+                information: information,
+                command: command,
+                imageURLs: imageURLs
+            )
             print("[result] \(result)")
             exit(0)
         } catch {
@@ -1756,11 +1788,11 @@ struct FluidPushToTalk {
     private static func loadAndRun(options: Options) async {
         do {
             let transcriber = FluidTranscriber()
-            try await transcriber.prepare(
+            let asrLanguage = try await transcriber.prepare(
                 modelVersion: options.config.asr.modelVersion,
                 language: options.config.asr.language
             )
-            log("FluidAudio ASR ready: model \(options.config.asr.modelVersion), language \(options.config.asr.language)")
+            log("FluidAudio ASR ready: model \(options.config.asr.modelVersion), language \(asrLanguage.displayValue)")
             let llmClient = CommandLLMClientFactory.make(config: options.config.localLLM)
             let readinessMonitor = LocalLLMReadinessMonitor(config: options.config, llmClient: llmClient)
             let recorder = AudioRecorder(audioInput: options.config.audioInput)

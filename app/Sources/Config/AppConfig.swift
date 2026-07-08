@@ -154,7 +154,7 @@ struct DebugConfig: Codable {
 
 struct AsrConfig: Codable {
     var modelVersion = "v3"
-    var language = "de"
+    var language = "system"
 
     enum CodingKeys: String, CodingKey {
         case modelVersion = "model_version"
@@ -371,6 +371,7 @@ struct LocalLLMConfig: Codable {
         case mlx
         case azureOpenAI = "azure_openai"
         case openAICompatible = "openai_compatible"
+        case cerebras
     }
 
     var enabled = true
@@ -386,7 +387,9 @@ struct LocalLLMConfig: Codable {
     var dotenvFile = ".env"
     private var dotenvURLs: [URL] = []
     var temperature = 0.0
+    var topP: Double?
     var maxTokens = 96
+    var imageContextEnabled = false
     var cacheSize = 4096
     var memorySize = 4096
     var timeoutSeconds: TimeInterval = 30
@@ -406,7 +409,9 @@ struct LocalLLMConfig: Codable {
         case apiKeyEnv = "api_key_env"
         case dotenvFile = "dotenv_file"
         case temperature
+        case topP = "top_p"
         case maxTokens = "max_tokens"
+        case imageContextEnabled = "image_context_enabled"
         case cacheSize = "cache_size"
         case memorySize = "memory_size"
         case timeoutSeconds = "timeout_seconds"
@@ -436,7 +441,12 @@ struct LocalLLMConfig: Codable {
         apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv) ?? apiKeyEnv
         dotenvFile = try container.decodeIfPresent(String.self, forKey: .dotenvFile) ?? dotenvFile
         temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? temperature
+        topP = try container.decodeIfPresent(Double.self, forKey: .topP) ?? topP
         maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? maxTokens
+        imageContextEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .imageContextEnabled
+        ) ?? imageContextEnabled
         cacheSize = try container.decodeIfPresent(Int.self, forKey: .cacheSize) ?? cacheSize
         memorySize = try container.decodeIfPresent(Int.self, forKey: .memorySize) ?? memorySize
         timeoutSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .timeoutSeconds) ?? timeoutSeconds
@@ -466,7 +476,7 @@ struct LocalLLMConfig: Codable {
     var chatCompletionsURL: URL? {
         let rawURL: String
         switch provider {
-        case .openAICompatible:
+        case .openAICompatible, .cerebras:
             rawURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? endpoint : baseURL
         case .azureOpenAI, .mlx:
             rawURL = endpoint

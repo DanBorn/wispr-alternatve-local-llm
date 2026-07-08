@@ -15,6 +15,8 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
             return "Azure OpenAI \(config.model)"
         case .openAICompatible:
             return "OpenAI-compatible \(config.model)"
+        case .cerebras:
+            return "Cerebras \(config.model)"
         case .mlx:
             return "local MLX \(config.model)"
         }
@@ -26,12 +28,16 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
 
     func warmUp(systemPrompt: String) async throws {}
 
-    func complete(systemPrompt: String, userPrompt: String) async throws -> String {
+    func complete(systemPrompt: String, userPrompt: String, imageURLs: [URL]) async throws -> String {
         let maxAttempts = max(1, config.maxRetries + 1)
         var lastError: Error?
         for attempt in 1...maxAttempts {
             do {
-                return try await completeOnce(systemPrompt: systemPrompt, userPrompt: userPrompt)
+                return try await completeOnce(
+                    systemPrompt: systemPrompt,
+                    userPrompt: userPrompt,
+                    imageURLs: imageURLs
+                )
             } catch {
                 lastError = error
                 guard attempt < maxAttempts, shouldRetry(error) else {
@@ -44,7 +50,7 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
         throw lastError ?? CliError.invalidValue("\(displayName) command request failed")
     }
 
-    private func completeOnce(systemPrompt: String, userPrompt: String) async throws -> String {
+    private func completeOnce(systemPrompt: String, userPrompt: String, imageURLs: [URL]) async throws -> String {
         guard let url = config.chatCompletionsURL else {
             throw CliError.invalidValue("local_llm.endpoint or local_llm.base_url must be a valid chat completions URL")
         }
@@ -55,7 +61,8 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
                 requestTo: url,
                 apiKey: "",
                 systemPrompt: systemPrompt,
-                userPrompt: userPrompt
+                userPrompt: userPrompt,
+                imageURLs: imageURLs
             )
         }
         guard !apiKey.isEmpty else {
@@ -67,7 +74,8 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
             requestTo: url,
             apiKey: apiKey,
             systemPrompt: systemPrompt,
-            userPrompt: userPrompt
+            userPrompt: userPrompt,
+            imageURLs: imageURLs
         )
     }
 
@@ -75,7 +83,8 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
         requestTo url: URL,
         apiKey: String,
         systemPrompt: String,
-        userPrompt: String
+        userPrompt: String,
+        imageURLs: [URL]
     ) async throws -> String {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -91,10 +100,11 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
             ChatCompletionRequest(
                 model: config.model,
                 messages: [
-                    .init(role: "system", content: systemPrompt),
-                    .init(role: "user", content: userPrompt),
+                    .init(role: "system", content: .text(systemPrompt)),
+                    .init(role: "user", content: try userContent(text: userPrompt, imageURLs: imageURLs)),
                 ],
                 temperature: config.temperature,
+                topP: config.topP,
                 maxTokens: config.maxTokens,
                 stream: false
             )
@@ -114,6 +124,33 @@ final class AzureOpenAICommandLLMClient: CommandLLMClient, @unchecked Sendable {
         let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
         return decoded.choices.first?.message.content?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func userContent(text: String, imageURLs: [URL]) throws -> ChatMessageContent {
+        guard !imageURLs.isEmpty else {
+            return .text(text)
+        }
+        var parts: [ChatContentPart] = [.text(text)]
+        for imageURL in imageURLs {
+            parts.append(.imageURL(try dataURL(for: imageURL)))
+        }
+        return .parts(parts)
+    }
+
+    private func dataURL(for url: URL) throws -> String {
+        let data = try Data(contentsOf: url)
+        return "data:\(mimeType(for: url));base64,\(data.base64EncodedString())"
+    }
+
+    private func mimeType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "jpg", "jpeg":
+            return "image/jpeg"
+        case "webp":
+            return "image/webp"
+        default:
+            return "image/png"
+        }
     }
 
     private func errorSummary(from data: Data) -> String {
@@ -157,6 +194,7 @@ private struct ChatCompletionRequest: Encodable {
     let model: String
     let messages: [ChatMessage]
     let temperature: Double
+    let topP: Double?
     let maxTokens: Int
     let stream: Bool
 
@@ -164,14 +202,62 @@ private struct ChatCompletionRequest: Encodable {
         case model
         case messages
         case temperature
+        case topP = "top_p"
         case maxTokens = "max_tokens"
         case stream
     }
 }
 
-private struct ChatMessage: Codable {
+private struct ChatMessage: Encodable {
     let role: String
-    let content: String
+    let content: ChatMessageContent
+}
+
+private enum ChatMessageContent: Encodable {
+    case text(String)
+    case parts([ChatContentPart])
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .text(value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        case let .parts(value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        }
+    }
+}
+
+private enum ChatContentPart: Encodable {
+    case text(String)
+    case imageURL(String)
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case text
+        case imageURL = "image_url"
+    }
+
+    enum ImageURLCodingKeys: String, CodingKey {
+        case url
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .text(value):
+            try container.encode("text", forKey: .type)
+            try container.encode(value, forKey: .text)
+        case let .imageURL(value):
+            try container.encode("image_url", forKey: .type)
+            var imageContainer = container.nestedContainer(
+                keyedBy: ImageURLCodingKeys.self,
+                forKey: .imageURL
+            )
+            try imageContainer.encode(value, forKey: .url)
+        }
+    }
 }
 
 private struct ChatCompletionResponse: Decodable {

@@ -7,6 +7,7 @@ struct Options {
     var command = RuntimeCommand.run
     var testCommandInformation: String?
     var testCommand: String?
+    var testCommandImage: URL?
     var testBluetoothKeyboardText: String?
     var configResetConfirmed = false
 
@@ -53,7 +54,9 @@ struct Options {
             case "--model-version":
                 options.config.asr.modelVersion = try value(after: argument, in: arguments, at: &index)
             case "--language":
-                options.config.asr.language = try value(after: argument, in: arguments, at: &index)
+                options.config.asr.language = AsrLanguageResolver.normalizePreference(
+                    try value(after: argument, in: arguments, at: &index)
+                )
             case "--output-dir":
                 options.config.recordings.outputDir = try value(after: argument, in: arguments, at: &index)
             case "--no-paste":
@@ -76,6 +79,8 @@ struct Options {
                 options.testCommandInformation = try value(after: argument, in: arguments, at: &index)
             case "--test-command":
                 options.testCommand = try value(after: argument, in: arguments, at: &index)
+            case "--test-command-image":
+                options.testCommandImage = URL(fileURLWithPath: try value(after: argument, in: arguments, at: &index).expandingTilde)
             case "--test-bluetooth-keyboard":
                 options.testBluetoothKeyboardText = try value(after: argument, in: arguments, at: &index)
             default:
@@ -93,8 +98,10 @@ struct Options {
         if !["v2", "v3"].contains(options.config.asr.modelVersion) {
             throw CliError.invalidValue("--model-version must be v2 or v3")
         }
-        if options.config.asr.language != "auto", Language(rawValue: options.config.asr.language) == nil {
-            throw CliError.invalidValue("--language must be auto or a supported code like de, en, es, fr")
+        if !AsrLanguageResolver.isValidPreference(options.config.asr.language) {
+            throw CliError.invalidValue(
+                "--language must be system, auto, or a supported code: \(AsrLanguageResolver.supportedCodeList)"
+            )
         }
         if options.config.paste.pasteDelay < 0 {
             throw CliError.invalidValue("--paste-delay must not be negative")
@@ -128,7 +135,9 @@ struct Options {
         if options.config.localLLM.maxRetries < 0 {
             throw CliError.invalidValue("local_llm.max_retries must not be negative")
         }
-        if options.config.localLLM.provider == .azureOpenAI || options.config.localLLM.provider == .openAICompatible {
+        if options.config.localLLM.provider == .azureOpenAI
+            || options.config.localLLM.provider == .openAICompatible
+            || options.config.localLLM.provider == .cerebras {
             if options.config.localLLM.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 throw CliError.invalidValue("local_llm.model must be set for remote command generation")
             }
@@ -149,6 +158,10 @@ struct Options {
         }
         if (options.testCommandInformation == nil) != (options.testCommand == nil) {
             throw CliError.invalidValue("--test-command-information and --test-command must be used together")
+        }
+        if let testCommandImage = options.testCommandImage,
+           !FileManager.default.fileExists(atPath: testCommandImage.path) {
+            throw CliError.invalidValue("--test-command-image file does not exist: \(testCommandImage.path)")
         }
     }
 
@@ -234,7 +247,7 @@ struct Options {
             Options:
               --config PATH                Config file. Default: ~/.config/fluid-push-to-talk/config.json.
               --model-version v3|v2        ASR model version. v3 is multilingual, v2 is English-only.
-              --language CODE|auto         Language hint. Default: de.
+              --language CODE|system|auto  Language hint. Default: system.
               --output-dir PATH            Directory for --save-recordings output.
               --save-recordings            Keep recordings instead of deleting temp files.
               --paste                      Paste final text into the focused field.
@@ -244,6 +257,7 @@ struct Options {
               --restore-clipboard-delay S  Wait before restoring clipboard. Default: 0.5.
               --test-command-information T Run command-result generation for test input.
               --test-command T             Command used with --test-command-information.
+              --test-command-image PATH    Optional image sent with --test-command-information when image context is enabled.
               --test-bluetooth-keyboard T  Send text through the configured ESP32 keyboard.
               -h, --help                   Show this help.
 

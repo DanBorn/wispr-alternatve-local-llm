@@ -15,8 +15,9 @@ final class CommandResultGenerator: @unchecked Sendable {
         self.skillCallingService = skillCallingService ?? SkillCallingService(config: config)
     }
 
-    func generate(information: String, command: String) async throws -> String {
+    func generate(information: String, command: String, imageURLs: [URL] = []) async throws -> String {
         let request = normalizedRequest(information: information, command: command)
+        let activeImageURLs = config.localLLM.imageContextEnabled ? imageURLs : []
         guard config.localLLM.canGenerateCommands else {
             let skillContext = skillCallingService.buildContext(
                 information: request.information,
@@ -44,10 +45,14 @@ final class CommandResultGenerator: @unchecked Sendable {
                 command: request.command,
                 skillContext: skillContext.renderedContext
             )
+            if !activeImageURLs.isEmpty {
+                log("command LLM image context attached (\(activeImageURLs.count) image(s))")
+            }
             LLMDebugLogger.logPrompt(prompt, label: "core-command", config: config)
             let content = try await llmClient.complete(
                 systemPrompt: config.prompts.coreCommand.system,
-                userPrompt: prompt
+                userPrompt: prompt,
+                imageURLs: activeImageURLs
             )
             guard !content.isEmpty else {
                 throw CliError.invalidValue("command LLM returned an empty response")

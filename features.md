@@ -54,6 +54,8 @@
 ## Command LLM Integration
 
 - Uses the OpenAI-compatible Chat Completions schema for command transformations by default.
+- Includes a first-class Cerebras provider preset for `gemma-4-31b` at `https://api.cerebras.ai/v1` using `CEREBRAS_API_KEY` from the local `.env` file.
+- `local_llm.image_context_enabled` attaches a PNG screenshot as an OpenAI-compatible `image_url` content part for command enhancement when enabled; the Cerebras preset enables it by default.
 - Supports generic `base_url`, `model`, and `OPENAI_API_KEY` configuration through the setup wizard.
 - Keeps Azure DeepSeek available as an explicit hosted-provider preset.
 - Keeps the MLX Swift Examples `llm-tool chat` client available as a configurable fallback provider.

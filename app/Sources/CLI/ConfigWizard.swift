@@ -16,6 +16,12 @@ enum ConfigWizard {
     private static let defaultOpenAIModel = "gpt-5.4-mini"
     private static let defaultOpenAIAPIKeyEnv = "OPENAI_API_KEY"
     private static let defaultAzureEndpoint = "https://dparnold-2501-resource.services.ai.azure.com/openai/v1/chat/completions"
+    private static let defaultCerebrasBaseURL = "https://api.cerebras.ai/v1"
+    private static let defaultCerebrasModel = "gemma-4-31b"
+    private static let defaultCerebrasAPIKeyEnv = "CEREBRAS_API_KEY"
+    private static let defaultCerebrasTemperature = 1.0
+    private static let defaultCerebrasTopP = 0.95
+    private static let defaultCerebrasMaxTokens = 32768
 
     static func runSetup(configPath: URL?) throws {
         let paths = ConfigPaths(configPath: configPath)
@@ -40,6 +46,7 @@ enum ConfigWizard {
                 "Dictate text, paste transcripts, and optionally use command mode with an OpenAI-compatible API."
             )
             applySimpleSetup(to: &config)
+            configureASR(config: &config, input: input)
             configureOpenAICompatible(
                 config: &config,
                 input: input,
@@ -52,6 +59,7 @@ enum ConfigWizard {
                 "Configure provider, shortcuts, command mode, Markdown dump, Hermes Agent, Bluetooth keyboard output, and paths."
             )
             applyAdvancedSetup(to: &config)
+            configureASR(config: &config, input: input)
             configureCommandLLM(config: &config, input: input, secretUpdates: &secretUpdates)
             configureShortcuts(config: &config, input: input)
             configureHermesAgent(config: &config, input: input)
@@ -128,7 +136,7 @@ enum ConfigWizard {
         print("Config: \(paths.configURL.path)")
         print("Prompt config: \(config.promptConfigFile)")
         print("Text replacements: \(config.textReplacementsFile)")
-        print("ASR: \(config.asr.modelVersion), language \(config.asr.language)")
+        print("ASR: \(config.asr.modelVersion), language \(asrLanguageSummary(config.asr.language))")
         print("Audio input: \(audioInputSummary(config.audioInput))")
         print("Paste shortcut: \(config.hotkeys.paste.displayName)")
         print("Dump shortcut: \(config.hotkeys.dump.displayName)")
@@ -171,6 +179,11 @@ enum ConfigWizard {
             passed: fileManager.fileExists(atPath: paths.supportFileURL(named: config.textReplacementsFile).path)
                 || fileManager.fileExists(atPath: AppConfig.repositoryTextReplacementsURL.path),
             detail: config.textReplacementsFile
+        ))
+        checks.append(.init(
+            name: "ASR language",
+            passed: AsrLanguageResolver.isValidPreference(config.asr.language),
+            detail: asrLanguageSummary(config.asr.language)
         ))
 
         do {
@@ -293,6 +306,7 @@ enum ConfigWizard {
         config.promptConfigFile = "promptConfig.json"
         config.textReplacementsFile = "textReplacements.json"
         config.audioInput = AudioInputConfig()
+        config.asr.language = AsrLanguageResolver.normalizePreference(config.asr.language)
         config.localLLM.dotenvFile = ".env"
         config.localLLM.requestTimeoutSeconds = 15
         config.localLLM.maxRetries = 1
@@ -313,6 +327,12 @@ enum ConfigWizard {
         config.localLLM.endpoint = ""
         config.localLLM.baseURL = defaultOpenAIBaseURL
         config.localLLM.apiKeyEnv = defaultOpenAIAPIKeyEnv
+        config.localLLM.temperature = 0
+        config.localLLM.topP = nil
+        config.localLLM.maxTokens = 128
+        config.localLLM.imageContextEnabled = false
+        config.asr.modelVersion = "v3"
+        config.asr.language = AsrLanguageResolver.systemPreference
         config.hotkeys.paste = HotkeyConfig(control: false, option: true, command: true, shift: false)
         config.hotkeys.dump = HotkeyConfig(control: true, option: true, command: false, shift: false)
         config.hotkeys.bluetooth = KeyChordConfig(keys: [], enabled: false)
@@ -330,6 +350,65 @@ enum ConfigWizard {
         config.llmOutput.dump = .dump
     }
 
+    private static func configureASR(config: inout AppConfig, input: WizardInput) {
+        let systemCode = AsrLanguageResolver.systemSupportedLanguageCode() ?? AsrLanguageResolver.autoPreference
+        let current = AsrLanguageResolver.normalizePreference(config.asr.language)
+        let options = [
+            "System Language (\(systemCode))",
+            "Auto detect",
+            "German (de)",
+            "English (en)",
+            "Spanish (es)",
+            "French (fr)",
+            "Custom code",
+        ]
+        let defaultIndex: Int
+        switch current {
+        case AsrLanguageResolver.autoPreference:
+            defaultIndex = 1
+        case "de":
+            defaultIndex = 2
+        case "en":
+            defaultIndex = 3
+        case "es":
+            defaultIndex = 4
+        case "fr":
+            defaultIndex = 5
+        case AsrLanguageResolver.systemPreference:
+            defaultIndex = 0
+        default:
+            defaultIndex = 6
+        }
+
+        let choice = input.choose(prompt: "Transcription language", options: options, defaultIndex: defaultIndex)
+        switch choice {
+        case 1:
+            config.asr.language = AsrLanguageResolver.autoPreference
+        case 2:
+            config.asr.language = "de"
+        case 3:
+            config.asr.language = "en"
+        case 4:
+            config.asr.language = "es"
+        case 5:
+            config.asr.language = "fr"
+        case 6:
+            let raw = input.prompt(
+                "Language code",
+                defaultValue: AsrLanguageResolver.isValidPreference(current) ? current : AsrLanguageResolver.systemPreference
+            )
+            let normalized = AsrLanguageResolver.normalizePreference(raw)
+            if AsrLanguageResolver.isValidPreference(normalized) {
+                config.asr.language = normalized
+            } else {
+                print("WARN Unsupported ASR language '\(raw)'; using system.")
+                config.asr.language = AsrLanguageResolver.systemPreference
+            }
+        default:
+            config.asr.language = AsrLanguageResolver.systemPreference
+        }
+    }
+
     private static func configureCommandLLM(
         config: inout AppConfig,
         input: WizardInput,
@@ -338,6 +417,7 @@ enum ConfigWizard {
         let choice = input.choose(
             prompt: "Choose command LLM provider",
             options: [
+                "Cerebras Gemma-4-31B",
                 "OpenAI-compatible API",
                 "Azure DeepSeek-V4-Flash",
                 "Local MLX/Bonsai",
@@ -348,8 +428,11 @@ enum ConfigWizard {
 
         switch choice {
         case 0:
-            configureOpenAICompatible(config: &config, input: input, secretUpdates: &secretUpdates)
+            applyCerebras(to: &config)
+            configureRemoteToken(config: &config, input: input, secretUpdates: &secretUpdates)
         case 1:
+            configureOpenAICompatible(config: &config, input: input, secretUpdates: &secretUpdates)
+        case 2:
             config.localLLM.enabled = true
             config.localLLM.commandGenerationEnabled = true
             config.localLLM.provider = .azureOpenAI
@@ -357,8 +440,10 @@ enum ConfigWizard {
             config.localLLM.endpoint = defaultAzureEndpoint
             config.localLLM.baseURL = ""
             config.localLLM.apiKeyEnv = "AZURE_OPENAI_API_KEY"
+            config.localLLM.topP = nil
+            config.localLLM.imageContextEnabled = false
             configureRemoteToken(config: &config, input: input, secretUpdates: &secretUpdates)
-        case 2:
+        case 3:
             config.localLLM.enabled = true
             config.localLLM.commandGenerationEnabled = true
             config.localLLM.provider = .mlx
@@ -369,12 +454,30 @@ enum ConfigWizard {
             config.localLLM.llmTool = input.prompt("llm-tool path", defaultValue: config.localLLM.llmTool)
             config.localLLM.mlxRun = input.prompt("mlx-run path", defaultValue: config.localLLM.mlxRun)
             config.localLLM.download = input.prompt("Model download/cache path", defaultValue: config.localLLM.download)
-        case 3:
+            config.localLLM.topP = nil
+            config.localLLM.imageContextEnabled = false
+        case 4:
             config.localLLM.enabled = false
             config.localLLM.commandGenerationEnabled = false
+            config.localLLM.imageContextEnabled = false
         default:
             configureOpenAICompatible(config: &config, input: input, secretUpdates: &secretUpdates)
         }
+    }
+
+    private static func applyCerebras(to config: inout AppConfig) {
+        config.localLLM.enabled = true
+        config.localLLM.commandGenerationEnabled = true
+        config.localLLM.provider = .cerebras
+        config.localLLM.model = defaultCerebrasModel
+        config.localLLM.endpoint = ""
+        config.localLLM.baseURL = defaultCerebrasBaseURL
+        config.localLLM.apiKeyEnv = defaultCerebrasAPIKeyEnv
+        config.localLLM.temperature = defaultCerebrasTemperature
+        config.localLLM.topP = defaultCerebrasTopP
+        config.localLLM.maxTokens = defaultCerebrasMaxTokens
+        config.localLLM.imageContextEnabled = true
+        config.localLLM.requestTimeoutSeconds = 30
     }
 
     private static func configureOpenAICompatible(
@@ -418,6 +521,10 @@ enum ConfigWizard {
         config.localLLM.provider = .openAICompatible
         config.localLLM.endpoint = ""
         config.localLLM.baseURL = input.prompt("Base URL without /chat/completions", defaultValue: defaults.baseURL)
+        config.localLLM.temperature = 0
+        config.localLLM.topP = nil
+        config.localLLM.maxTokens = 128
+        config.localLLM.imageContextEnabled = false
         if defaults.model.isEmpty {
             config.localLLM.model = input.promptRequired("Model name/slug")
         } else {
@@ -618,6 +725,7 @@ enum ConfigWizard {
     private static func review(config: AppConfig, paths: ConfigPaths, includeAdvanced: Bool) {
         printHeader("Review")
         print("Config: \(paths.configURL.path)")
+        print("ASR language: \(asrLanguageSummary(config.asr.language))")
         print("Command LLM: \(llmSummary(config.localLLM))")
         print("Paste shortcut: \(config.hotkeys.paste.displayName) -> \(config.llmOutput.paste.rawValue)")
         if includeAdvanced {
@@ -641,18 +749,28 @@ enum ConfigWizard {
 
     private static let defaultDailyNotePath = "~/Documents/Obsidian/Daily Notes/YYYY-MM-DD.md"
 
+    private static func asrLanguageSummary(_ language: String) -> String {
+        AsrLanguageResolver.resolve(language).displayValue
+    }
+
     private static func llmSummary(_ config: LocalLLMConfig) -> String {
         guard config.canGenerateCommands else {
             return "disabled"
         }
         switch config.provider {
         case .azureOpenAI:
-            return "Azure OpenAI \(config.model) @ \(config.endpoint)"
+            return "Azure OpenAI \(config.model) @ \(config.endpoint)\(imageContextSummary(config))"
         case .openAICompatible:
-            return "OpenAI-compatible \(config.model) @ \(config.chatCompletionsURL?.absoluteString ?? config.baseURL)"
+            return "OpenAI-compatible \(config.model) @ \(config.chatCompletionsURL?.absoluteString ?? config.baseURL)\(imageContextSummary(config))"
+        case .cerebras:
+            return "Cerebras \(config.model) @ \(config.chatCompletionsURL?.absoluteString ?? config.baseURL)\(imageContextSummary(config))"
         case .mlx:
-            return "MLX \(config.model)"
+            return "MLX \(config.model)\(imageContextSummary(config))"
         }
+    }
+
+    private static func imageContextSummary(_ config: LocalLLMConfig) -> String {
+        config.imageContextEnabled ? " + image context" : ""
     }
 
     private static func hermesSummary(_ config: HermesAgentConfig, hotkeys: HotkeysConfig) -> String {

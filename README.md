@@ -2,14 +2,14 @@
 
 FluidAudio Push To Talk is a native macOS voice dictation app for Apple Silicon Macs. It is built for people who want a fast Wispr Flow alternative with local transcription, local-first command mode, and control over where text is sent.
 
-Hold a shortcut, speak, and the app pastes the transcript into the focused field. On Mac M chips, speech recognition runs locally with FluidAudio/CoreML. Command mode can use an OpenAI-compatible API, a local LM Studio server, or the MLX/Bonsai local LLM fallback.
+Hold a shortcut, speak, and the app pastes the transcript into the focused field. On Mac M chips, speech recognition runs locally with FluidAudio/CoreML. Command mode can use Cerebras, an OpenAI-compatible API, a local LM Studio server, or the MLX/Bonsai local LLM fallback.
 
 ## Why Use It
 
 - Local macOS dictation for Mac M1, M2, M3, and M4 chips.
 - Push-to-talk paste into any focused app.
 - Optional two-step command mode: dictate context, then speak an instruction and paste the LLM result.
-- Setup supports OpenAI-compatible APIs, Local LM Studio, Azure, and Local MLX/Bonsai.
+- Setup supports Cerebras, OpenAI-compatible APIs, Local LM Studio, Azure, and Local MLX/Bonsai.
 - Optional Obsidian daily-note dumping, Hermes Agent handoff, and ESP32 Bluetooth keyboard output.
 
 See [appBehavior.md](appBehavior.md) for the detailed shortcut behavior.
@@ -35,6 +35,7 @@ For an existing local checkout:
 The initial install command above opens setup automatically. Pick the LLM path there:
 
 - **Simple Setup:** fastest start. Uses an OpenAI-compatible API and asks for the API token.
+- **Advanced Setup > Cerebras Gemma-4-31B:** uses `CEREBRAS_API_KEY`, `https://api.cerebras.ai/v1`, and can attach screenshot image context for command enhancement.
 - **Advanced Setup > Local LM Studio:** use a local OpenAI-compatible server at `http://localhost:1234/v1`.
 - **Advanced Setup > Local MLX/Bonsai:** use the local MLX fallback with `llm-tool` or `mlx-run` and the default `prism-ml/Ternary-Bonsai-8B-mlx-2bit` model.
 - **Advanced Setup > Disabled:** keep normal local transcription and turn off command generation.
@@ -96,7 +97,23 @@ The command LLM config uses the OpenAI-compatible Chat Completions shape:
   "provider": "openai_compatible",
   "base_url": "https://api.openai.com/v1",
   "model": "gpt-5.4-mini",
-  "api_key_env": "OPENAI_API_KEY"
+  "api_key_env": "OPENAI_API_KEY",
+  "image_context_enabled": false
+}
+```
+
+For Cerebras multimodal command enhancement:
+
+```json
+{
+  "provider": "cerebras",
+  "base_url": "https://api.cerebras.ai/v1",
+  "model": "gemma-4-31b",
+  "api_key_env": "CEREBRAS_API_KEY",
+  "temperature": 1,
+  "top_p": 0.95,
+  "max_tokens": 32768,
+  "image_context_enabled": true
 }
 ```
 
@@ -149,7 +166,7 @@ app/.build/debug/fluid-push-to-talk --save-recordings
 app/.build/debug/fluid-push-to-talk --language auto
 ```
 
-The first run downloads and compiles the FluidAudio ASR models. By default the checked-in config uses the multilingual v3 model with a German language hint.
+The first run downloads and compiles the FluidAudio ASR models. By default the checked-in config uses the multilingual v3 model and resolves the ASR language from the macOS system language.
 
 ## Bluetooth Keyboard Output
 

@@ -43,6 +43,9 @@ def main() -> int:
     if local_llm.get("api_key_env") != "OPENAI_API_KEY":
         print("command LLM secret regression: api_key_env must default to OPENAI_API_KEY", file=sys.stderr)
         return 1
+    if local_llm.get("image_context_enabled") is not False:
+        print("command LLM image regression: default image_context_enabled must be false", file=sys.stderr)
+        return 1
 
     azure_source = (
         REPO_ROOT / "app" / "Sources" / "LocalLLM" / "AzureOpenAICommandLLMClient.swift"
@@ -58,7 +61,7 @@ def main() -> int:
     )
     if (
         "AzureOpenAICommandLLMClient" not in factory_source
-        or "case .azureOpenAI, .openAICompatible" not in factory_source
+        or "case .azureOpenAI, .openAICompatible, .cerebras" not in factory_source
     ):
         print("command LLM provider regression: OpenAI-compatible provider factory branch is missing", file=sys.stderr)
         return 1
@@ -70,7 +73,14 @@ def main() -> int:
         if expected not in azure_source:
             print(f"command LLM auth regression: missing {expected}", file=sys.stderr)
             return 1
-    for expected in ['maxTokens = "max_tokens"', "ChatCompletionResponse", "session.data(for: request)"]:
+    for expected in [
+        'maxTokens = "max_tokens"',
+        'topP = "top_p"',
+        'imageURL = "image_url"',
+        "ChatMessageContent",
+        "ChatCompletionResponse",
+        "session.data(for: request)",
+    ]:
         if expected not in azure_source:
             print(f"command LLM chat completions request regression: missing {expected}", file=sys.stderr)
             return 1
@@ -107,6 +117,9 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     if 'case commandGenerationEnabled = "command_generation_enabled"' not in app_config_source:
         print("local LLM command toggle regression: config key is missing", file=sys.stderr)
+        return 1
+    if 'case imageContextEnabled = "image_context_enabled"' not in app_config_source:
+        print("local LLM image regression: image_context_enabled config key is missing", file=sys.stderr)
         return 1
     if "var canGenerateCommands: Bool" not in app_config_source:
         print("local LLM command toggle regression: computed command gate is missing", file=sys.stderr)

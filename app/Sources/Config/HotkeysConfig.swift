@@ -21,7 +21,7 @@ enum HotkeyAction {
 enum RecordingState {
     case idle
     case recordingInformation(action: HotkeyAction)
-    case recordingInstruction(action: HotkeyAction, informationURL: URL)
+    case recordingInstruction(action: HotkeyAction, informationURL: URL, imageURL: URL?)
     case recordingHermesInstruction(informationURL: URL, screenshotURL: URL?)
 }
 

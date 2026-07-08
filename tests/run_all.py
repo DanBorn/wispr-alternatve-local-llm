@@ -46,6 +46,8 @@ def validate_config() -> bool:
     config = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
     local_llm = config["local_llm"]
     errors = []
+    if config.get("asr", {}).get("language") != "system":
+        errors.append("asr.language must default to system")
     if local_llm.get("command_generation_enabled") is not True:
         errors.append("local_llm.command_generation_enabled must default to true")
     if local_llm.get("provider") != REQUIRED_COMMAND_LLM_PROVIDER:
@@ -62,8 +64,12 @@ def validate_config() -> bool:
         errors.append("local_llm.dotenv_file must default to .env")
     if local_llm["temperature"] != 0:
         errors.append("local_llm.temperature must be 0 for deterministic fast command generation")
+    if local_llm.get("top_p") is not None:
+        errors.append("local_llm.top_p must default to null for deterministic generic command generation")
     if local_llm["max_tokens"] > 128:
         errors.append("local_llm.max_tokens should stay small for latency")
+    if local_llm.get("image_context_enabled") is not False:
+        errors.append("local_llm.image_context_enabled must default to false unless a multimodal provider is explicitly configured")
     if local_llm.get("request_timeout_seconds") != 15:
         errors.append("local_llm.request_timeout_seconds must allow normal hosted API variance without old single-request stalls")
     if local_llm.get("max_retries") != 1:
@@ -126,6 +132,7 @@ def validate_help() -> bool:
         "--model-version v3|v2",
         "--test-command-information",
         "--test-command",
+        "--test-command-image",
     ]
     missing = [item for item in expected if item not in completed.stdout]
     if completed.returncode != 0 or missing:
