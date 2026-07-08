@@ -5,6 +5,7 @@
       "Use Tool output if present.",
       "Keep answers concise and complete.",
       "Use at most two short sentences unless the task asks for more.",
+      "Keep the language the user spoke unless the user says reply in a different language.",
       "Output only the result."
     ],
     "user_template": [
