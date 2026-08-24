@@ -18,11 +18,35 @@ enum HotkeyAction {
     }
 }
 
+enum RecordingRoutePolicy {
+    static func isOneSegmentHermes(action: HotkeyAction, mode: ControlOptionMode) -> Bool {
+        action == .dump && mode == .hermes
+    }
+
+    static func supportsScreenshots(action: HotkeyAction) -> Bool {
+        action == .paste || action == .dump
+    }
+
+    static func providerImages(action: HotkeyAction, images: [URL]) -> [URL] {
+        action == .paste ? images : []
+    }
+
+    static func deliveryImages(action: HotkeyAction, images: [URL]) -> [URL] {
+        action == .dump ? images : []
+    }
+}
+
 enum RecordingState {
     case idle
-    case recordingInformation(action: HotkeyAction)
-    case recordingInstruction(action: HotkeyAction, informationURL: URL, imageURL: URL?)
-    case recordingHermesInstruction(informationURL: URL, screenshotURL: URL?)
+    case recordingInformation(
+        action: HotkeyAction,
+        screenshotTasks: [Task<URL?, Never>]
+    )
+    case recordingInstruction(
+        action: HotkeyAction,
+        informationURL: URL,
+        screenshotTasks: [Task<URL?, Never>]
+    )
 }
 
 struct HotkeysConfig: Codable {
@@ -80,14 +104,6 @@ struct HotkeysConfig: Codable {
         }
     }
 
-    func isHermesAgentContinuationPressed(for action: HotkeyAction, in flags: CGEventFlags) -> Bool {
-        switch action {
-        case .paste:
-            return isOptionOnlyPressed(in: flags)
-        case .dump, .bluetooth:
-            return false
-        }
-    }
 }
 
 struct HotkeyKey: Codable, Hashable, RawRepresentable {

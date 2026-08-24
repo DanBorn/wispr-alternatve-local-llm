@@ -7,7 +7,9 @@ struct Options {
     var command = RuntimeCommand.run
     var testCommandInformation: String?
     var testCommand: String?
-    var testCommandImage: URL?
+    var testCommandImages: [URL] = []
+    var testHermesInstruction: String?
+    var testHermesImages: [URL] = []
     var testBluetoothKeyboardText: String?
     var configResetConfirmed = false
 
@@ -80,7 +82,15 @@ struct Options {
             case "--test-command":
                 options.testCommand = try value(after: argument, in: arguments, at: &index)
             case "--test-command-image":
-                options.testCommandImage = URL(fileURLWithPath: try value(after: argument, in: arguments, at: &index).expandingTilde)
+                options.testCommandImages.append(
+                    URL(fileURLWithPath: try value(after: argument, in: arguments, at: &index).expandingTilde)
+                )
+            case "--test-hermes-instruction":
+                options.testHermesInstruction = try value(after: argument, in: arguments, at: &index)
+            case "--test-hermes-image":
+                options.testHermesImages.append(
+                    URL(fileURLWithPath: try value(after: argument, in: arguments, at: &index).expandingTilde)
+                )
             case "--test-bluetooth-keyboard":
                 options.testBluetoothKeyboardText = try value(after: argument, in: arguments, at: &index)
             default:
@@ -117,51 +127,27 @@ struct Options {
                 "hotkeys.bluetooth.keys contains unsupported key '\(invalidBluetoothKey.rawValue)'"
             )
         }
-        if options.config.localLLM.maxTokens <= 0 {
-            throw CliError.invalidValue("local_llm.max_tokens must be greater than zero")
-        }
-        if options.config.localLLM.cacheSize <= 0 {
-            throw CliError.invalidValue("local_llm.cache_size must be greater than zero")
-        }
-        if options.config.localLLM.memorySize <= 0 {
-            throw CliError.invalidValue("local_llm.memory_size must be greater than zero")
-        }
-        if options.config.localLLM.timeoutSeconds <= 0 {
-            throw CliError.invalidValue("local_llm.timeout_seconds must be greater than zero")
-        }
-        if options.config.localLLM.requestTimeoutSeconds <= 0 {
-            throw CliError.invalidValue("local_llm.request_timeout_seconds must be greater than zero")
-        }
-        if options.config.localLLM.maxRetries < 0 {
-            throw CliError.invalidValue("local_llm.max_retries must not be negative")
-        }
-        if options.config.localLLM.provider == .azureOpenAI
-            || options.config.localLLM.provider == .openAICompatible
-            || options.config.localLLM.provider == .cerebras {
-            if options.config.localLLM.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                throw CliError.invalidValue("local_llm.model must be set for remote command generation")
-            }
-            if options.config.localLLM.chatCompletionsURL == nil {
-                throw CliError.invalidValue(
-                    "local_llm.endpoint or local_llm.base_url must be a valid chat completions URL"
-                )
-            }
-            let apiKeyEnv = options.config.localLLM.apiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
-            if options.config.localLLM.canGenerateCommands,
-               (options.testCommandInformation != nil || options.testCommand != nil),
-               !apiKeyEnv.isEmpty,
-               options.config.localLLM.resolvedAPIKey.isEmpty {
-                throw CliError.invalidValue(
-                    "\(apiKeyEnv) must be set in the environment or local_llm.dotenv_file"
-                )
-            }
-        }
         if (options.testCommandInformation == nil) != (options.testCommand == nil) {
             throw CliError.invalidValue("--test-command-information and --test-command must be used together")
         }
-        if let testCommandImage = options.testCommandImage,
-           !FileManager.default.fileExists(atPath: testCommandImage.path) {
-            throw CliError.invalidValue("--test-command-image file does not exist: \(testCommandImage.path)")
+        if options.testCommandImages.count > 5 {
+            throw CliError.invalidValue("--test-command-image supports at most five images")
+        }
+        if let missingImage = options.testCommandImages.first(where: {
+            !FileManager.default.fileExists(atPath: $0.path)
+        }) {
+            throw CliError.invalidValue("--test-command-image file does not exist: \(missingImage.path)")
+        }
+        if options.testHermesImages.count > 5 {
+            throw CliError.invalidValue("--test-hermes-image supports at most five images")
+        }
+        if !options.testHermesImages.isEmpty, options.testHermesInstruction == nil {
+            throw CliError.invalidValue("--test-hermes-image requires --test-hermes-instruction")
+        }
+        if let missingImage = options.testHermesImages.first(where: {
+            !FileManager.default.fileExists(atPath: $0.path)
+        }) {
+            throw CliError.invalidValue("--test-hermes-image file does not exist: \(missingImage.path)")
         }
     }
 
@@ -236,12 +222,12 @@ struct Options {
                    fluid-push-to-talk config [show|doctor|reset] [--config PATH]
 
             Hold Command + Option to record and paste. System audio is muted while recording and restored after capture.
-            Release Option first while holding Command to record a local command, then paste the LLM result when available.
-            Release Command first while holding Option to record a Hermes Agent instruction; a real Hermes/Poseidon session is foregrounded, the full prompt is visibly pasted and submitted there, and the answer exported from that same session is delivered back to the original app or clipboard.
-            Hold Control + Option to record and dump raw text.
-            Release Control first while holding Option to record a command, then dump the LLM result when available.
+            Release Option first while holding Command to start a spoken command with screenshot context. Release Command to send it to the configured provider and paste the result. Up to five screenshots may be attached.
+            Release Command first while holding Option to finish normal local dictation; Hermes no longer uses this gesture.
+            Control + Option is selected during setup: Markdown Dump writes the transcript plus optional P screenshots, while Hermes sends one spoken instruction plus optional P screenshots to a visible Hermes session.
+            In Markdown mode, release Control first while holding Option to record a provider command. The provider receives text only; its result and the captured screenshots are written to Markdown.
             After launch, type go and stop in the app Terminal for stop-triggered Obsidian recording. Press Tab to autocomplete terminal commands.
-            Configure llm_output.paste, llm_output.dump, and llm_output.bluetooth as clipboard, dump, or bluetooth-keyboard.
+            Choose OpenAI Responses with fixed gpt-5.6-luna, low reasoning, and low-detail screenshots, or Cerebras with fixed gemma-4-31b. OpenClaw is not a runtime option.
             Bluetooth push-to-talk is disabled by default; enable it in setup and choose a shortcut key.
 
             Options:
@@ -257,7 +243,9 @@ struct Options {
               --restore-clipboard-delay S  Wait before restoring clipboard. Default: 0.5.
               --test-command-information T Run command-result generation for test input.
               --test-command T             Command used with --test-command-information.
-              --test-command-image PATH    Optional image sent with --test-command-information when image context is enabled.
+              --test-command-image PATH    Optional screenshot sent with --test-command-information; up to five screenshots are supported by command mode.
+              --test-hermes-instruction T  Send text through the real visible Hermes runner and print its exported result.
+              --test-hermes-image PATH     Optional native Hermes image attachment; repeat up to five times.
               --test-bluetooth-keyboard T  Send text through the configured ESP32 keyboard.
               -h, --help                   Show this help.
 

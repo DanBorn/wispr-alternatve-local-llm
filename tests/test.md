@@ -1,251 +1,160 @@
 # Test Plan
 
-This file tracks coverage for the current feature set. Automated checks are marked with commands; macOS hotkey and permission behavior requires manual verification in a logged-in desktop session.
+This plan covers the two-provider command architecture, selectable `Control + Option` mode, Markdown image attachments, one-segment Hermes, and explicit `P` screenshot workflow. Physical hotkeys, microphone capture, foreground paste, permissions, Hermes Terminal control, and Bluetooth still need manual macOS verification.
 
-## Automated Checks
-
-Run the full automated suite after each software change:
+## Automated Suite
 
 ```bash
 python3 tests/run_all.py
 ```
 
-Use `python3 tests/run_all.py --skip-llm` only in environments without Metal/MLX access. The skipped run is not a substitute for the full suite before considering a change complete.
-
-### Swift Build
-
-- Feature coverage: app compilation, config decoding types, FluidAudio integration references.
-- Command:
+Without live API checks:
 
 ```bash
-cd app
-swift build
+python3 tests/run_all.py --skip-llm
 ```
 
-- Expected result: build completes successfully.
-- Latest result: pass on 2026-05-16 with no Swift warnings.
-
-### Full Automated Suite
-
-- Feature coverage: build, CLI help/version, config JSON, prompt JSON, skill frontmatter, audio recorder crash regression, generic skill tool calling, Bonsai generation speed, Bonsai command translation, and per-request chat history reset.
-- Command:
+Optional five-image live checks for OpenAI and Cerebras:
 
 ```bash
-python3 tests/run_all.py
+python3 tests/run_all.py --skip-llm --live-multi-image
 ```
 
-- Expected result: all checks pass. The Bonsai translation check requires a non-sandboxed macOS session with MLX/Metal access.
-- Latest result: pass on 2026-05-22 outside the sandbox; Bonsai speed regression reported 36.31 tokens/s and the translation regression completed in 1.98s.
+Report every skipped live check explicitly. Do not put keys, screenshots, or transcript content in test output.
 
-### Audio Recorder Crash Regression
+## Required Automated Coverage
 
-- Feature coverage: prevents AirPods/CoreAudio route rebuild crashes by requiring AVAudioRecorder capture without HAL input binding.
-- Command:
+### Build and Configuration
 
-```bash
-python3 tests/audio_recorder_static_case.py
-```
+- Swift build and Swift tests pass.
+- Checked-in JSON parses and defaults `command_provider` to `openai`.
+- Checked-in JSON defaults `control_option_mode` to `dump`; missing legacy values decode as `dump` and `hermes_agent.enabled` is not written.
+- `AppConfig` encodes and decodes `openai` and `cerebras`.
+- Installed config may override the repository default without changing tracked config.
+- Setup asks for provider choice, only the selected provider's hidden key, and Markdown Dump or Hermes for `Control + Option`.
+- Updating one key preserves the other key and enforces `.env` mode `0600`.
 
-- Expected result: static checks pass and the old `format: format` tap pattern is absent.
-- Latest result: pass on 2026-05-22.
+### OpenAI Client
 
-### CLI Help
+- Uses only `https://api.openai.com/v1/responses` and `gpt-5.6-luna`.
+- Sends `reasoning.effort: low`, `text.verbosity: low`, and `store: false` without an artificial output-token cap.
+- Supports zero images.
+- Encodes one through five ordered PNGs as Base64 `input_image` parts with `detail: low`.
+- Decodes output and handles incomplete or empty responses as errors.
+- Retries HTTP `429`, `5xx`, and timeout once.
 
-- Feature coverage: binary launch path and documented runtime options.
-- Command:
+### Cerebras Client
 
-```bash
-app/.build/debug/fluid-push-to-talk --help
-```
+- Uses only `https://api.cerebras.ai/v1/chat/completions` and `gemma-4-31b`.
+- Supports zero images and preserves one-to-five image order in Chat Completions content parts.
+- Decodes output and handles malformed or empty responses as errors.
+- Retries HTTP `429`, `5xx`, and timeout once.
 
-- Expected result: help output includes config path, ASR model/language overrides, paste controls, save-recordings, output directory options, and command-result test options.
-- Latest result: pass on 2026-05-16.
+### Provider Isolation
 
-### Version Output
+- Runtime constructs only the provider selected by `command_provider`.
+- No request failure invokes the other provider.
+- `CommandResultGenerator` propagates provider errors instead of returning the information transcript.
+- Runtime logs the provider failure and delivers no command output.
+- An empty instruction remains a pre-request information-transcript fallback.
 
-- Feature coverage: startup logs always include the app version.
-- Command:
+### Structured Diagnostics
 
-```bash
-app/.build/debug/fluid-push-to-talk --help
-```
+- OpenAI and Cerebras use one logical request ID across summary, attempt, retry, and terminal records.
+- Request summary asserts provider/model, system/user/total prompt character counts, image count, payload bytes, payload build milliseconds, and timeout.
+- Per-image records assert path, bytes, MIME, Base64 character count, and SHA-256 without raw Base64.
+- Attempt results assert `attempt=n/max`, duration, outcome, HTTP status, response bytes, and `x-request-id`/`request-id` metadata.
+- Retry records distinguish `timeout`, `http_429`, and `http_5xx`.
+- Terminal timeout asserts `NSError` domain `NSURLErrorDomain` and code `-1001`.
+- Captured logs never contain the API key, `Authorization` value, or raw Base64 content.
 
-- Expected result: first output line starts with `FluidAudio Push To Talk`.
-- Latest result: pass on 2026-05-16. Output starts with `FluidAudio Push To Talk 0.2.3`.
+### Failed Command Store
 
-### Default Config Shape
+- A provider, Hermes, Markdown, or delivery failure writes `turn.json` and ordered image copies under `last-failed-command/`.
+- The manifest preserves timestamp, provider/model, information, command, error, and image filename/bytes/SHA-256 metadata.
+- Root permissions are `0700`; `turn.json` and retained images are `0600`.
+- A newer failure replaces the previous turn through a staged backup-and-promote flow; startup recovery restores a valid backup after an interrupted promotion.
+- Only successful provider or Hermes response plus successful delivery clears the bundle.
+- Local dictation and empty-command fallback do not clear it.
 
-- Feature coverage: app-readable JSON config for ASR, hotkeys, paste, recordings, dump, generic skills, and local LLM.
-- Command:
+### Physical `P` Hotkey
 
-```bash
-python3 -m json.tool config/config.json >/dev/null
-```
+- Uses macOS keycode `35` for physical `P`.
+- Accepts captures during first-segment paste and `Control + Option` recordings, but never Bluetooth.
+- Ignores keyboard auto-repeat and uses key-up to reset the physical-key latch.
+- Swallows handled key-down and key-up events.
+- Preserves screenshot task order and caps the list at five.
+- Does not capture automatically during the transition to instruction recording.
+- Cleans screenshot files after local dictation, command completion, provider error, cancellation, and stale-file recovery.
 
-- Expected result: JSON parses successfully.
-- Latest result: pass on 2026-05-16.
+### Markdown Images and Hermes
 
-### Installed Config Shape
+- Markdown dump supports zero, one, and five ordered images.
+- Images are copied to `attachments/YYYY-MM-DD/` beside the note with collision-free filenames and relative `![Screenshot N](...)` embeds.
+- A failed note write rolls back newly copied attachments while preserving the temporary sources for retention.
+- A two-stage Dump command sends no images to OpenAI/Cerebras but writes them beside the provider result.
+- Hermes uses one speech segment and repeated native `/image` commands before the prompt; paths containing spaces remain intact.
+- A stale stored session ID is rejected even when `hermes sessions export` exits zero with `Session not found`; the state is removed and a new named session is created.
+- Terminal tab state and markers include the concrete session ID so a recreated session cannot reuse an obsolete visible tab.
+- `--test-hermes-instruction` plus repeated `--test-hermes-image` exercises the real visible runner without microphone input.
+- The old Command-first Hermes transition is absent, while visible session reuse, export, original-target delivery, timeout, cleanup, and failure retention remain covered.
 
-- Feature coverage: installed config used by default app launch.
-- Command:
+### Existing Regressions
 
-```bash
-python3 -m json.tool ~/.config/fluid-push-to-talk/config.json >/dev/null
-python3 -m json.tool ~/.config/fluid-push-to-talk/promptConfig.json >/dev/null
-```
+- Audio recorder stability, text replacement, and paste spacing.
+- Command and Hermes hotkey transitions.
+- Markdown and continuous Dump behavior.
+- Bluetooth protocol and delivery.
+- Installer, launch, CLI help, config doctor, and single-instance behavior.
 
-- Expected result: JSON parses successfully, uses MLX Swift `llm-tool chat` with `prism-ml/Ternary-Bonsai-8B-mlx-2bit`, and keeps LLM prompts in `promptConfig.json`.
-- Latest result: pass on 2026-05-15.
+## Manual macOS Checks
 
-### Skill Frontmatter
+### No-Image Command
 
-- Feature coverage: generic skill discovery and standard skill documentation.
-- Command:
+1. Start the app and focus a writable field.
+2. Hold `Command + Option` and dictate information without pressing `P`.
+3. Release `Option`, dictate the instruction, then release `Command`.
+4. Confirm a successful result is delivered and no screenshot file was created.
 
-```bash
-for file in skills/*/SKILL.md; do sed -n '1,4p' "$file"; done
-```
+### One and Five Images
 
-- Expected result: every skill starts with YAML frontmatter containing `name` and `description`.
-- Latest result: pass on 2026-05-15.
+1. Grant Screen & System Audio Recording permission to the launching terminal.
+2. During the first `Command + Option` recording, tap and release physical `P` once.
+3. Complete the instruction and confirm the selected provider receives one image.
+4. Repeat with five deliberate `P` taps and confirm order is preserved.
+5. Hold `P` and confirm auto-repeat creates no extra captures.
+6. Attempt a sixth tap and confirm it is ignored.
+7. Confirm temporary files are removed after completion.
 
-### Core Command Result Prompt Config
+### Scope and Cleanup
 
-- Feature coverage: command-result behavior is built into the app, not discovered as a skill, and prompt text lives in `promptConfig.json`.
-- Command:
+- Press `P` outside supported first recordings and confirm normal key behavior.
+- Capture an image, release both modifiers for local dictation, and confirm the image is deleted without upload.
+- Capture images, trigger a provider error, and confirm there is no pasted/dumped output and all images are deleted.
+- Deny screenshot permission, press `P`, and confirm audio plus a zero-image command still work.
 
-```bash
-test ! -e skills/command-result/SKILL.md
-python3 -m json.tool config/promptConfig.json >/dev/null
-```
+### Provider Selection and Failure
 
-- Expected result: the old command-result skill file is absent, prompt JSON parses, and command generation still builds.
-- Latest result: pass on 2026-05-15.
+- Run setup for OpenAI and verify only `OPENAI_API_KEY` changes.
+- Run setup for Cerebras and verify only `CEREBRAS_API_KEY` changes.
+- Confirm repository config still defaults to OpenAI while this Mac's installed config selects Cerebras.
+- Force each provider to fail and confirm no cross-provider request and no transcript fallback occurs.
+- Trigger a timeout and confirm attempt 1, `retry_reason=timeout`, attempt 2, and terminal domain/code remain correlated by one logical request ID.
 
-### Generic Skill Tool Calling
+### Retained Failure Bundle
 
-- Feature coverage: generic skill discovery, generic tool execution from skill frontmatter, and tool fallback behavior.
-- Command:
+1. Complete a provider, Hermes, or Markdown turn with screenshots and force request or delivery failure.
+2. Confirm `~/Library/Application Support/fluid-push-to-talk/last-failed-command/turn.json` and the image copies exist.
+3. Confirm directory mode `0700` and file modes `0600`.
+4. Trigger a second failure and confirm it replaces the first bundle.
+5. Perform local dictation and an empty-command fallback; confirm neither clears the bundle.
+6. Complete and deliver a successful provider or Hermes turn; confirm the directory is removed.
 
-```bash
-python3 tests/generic_tool_case.py
-```
+### Control + Option Modes and Unchanged Features
 
-- Expected result: the `greet` skill is selected through generic metadata and returns its tool output with local LLM disabled.
-- Latest result: pass on 2026-05-16.
-
-### OpenAI-Compatible Command LLM Smoke
-
-- Feature coverage: configured command LLM availability for command modes.
-- Command:
-
-```bash
-python3 tests/local_llm_speed_case.py
-```
-
-- Expected result: the app calls the configured OpenAI-compatible Chat Completions endpoint and receives `OK`.
-- Latest result: live run requires `OPENAI_API_KEY`; use `OPENAI_BASE_URL` and `OPENAI_MODEL` to test another OpenAI-compatible router.
-
-### Command LLM Provider Static Case
-
-- Feature coverage: active command provider and model stay wired to the OpenAI-compatible default while MLX and Azure remain available as fallback/preset providers.
-- Command:
-
-```bash
-python3 tests/local_llm_model_static_case.py
-```
-
-- Expected result: config uses `provider: openai_compatible`, `base_url`, `model`, and `OPENAI_API_KEY` without storing any secret value in JSON.
-- Latest result: pass on 2026-06-18.
-
-### Translation Command Case
-
-- Feature coverage: German information plus German command asking for English translation.
-- Command:
-
-```bash
-python3 tests/translation_case.py
-```
-
-- Expected result: output is an English translation, not the original German source, and the logged LLM request puts the command before the information.
-- Latest result: live run requires `OPENAI_API_KEY`.
-
-
-### Console Readiness Output
-
-- Feature coverage: startup visibility and warm persistent session for the configured local LLM.
-- Steps:
-  1. Confirm the configured `local_llm.mlx_run` path is executable.
-  2. Start the app with `./launch.sh`.
-  3. Confirm the console prints the configured model, `loading local MLX llm-tool model once`, and `local MLX llm-tool ready` before the `Hold ... to paste` line.
-- Latest result: pending manual verification in an interactive app run.
-
-## Manual Checks
-
-### Paste Mode
-
-- Feature coverage: `Command + Option` recording, transcription, clipboard paste, clipboard restoration.
-- Steps:
-  1. Start the app with `./launch.sh`.
-  2. Focus a writable text field.
-  3. Hold `Command + Option`, dictate a short sentence, then release both keys.
-  4. Confirm the transcribed text is pasted into the focused field.
-- Latest result: pending.
-
-### Paste Command Mode
-
-- Feature coverage: two-segment paste workflow, local LLM command transformation, fallback behavior.
-- Steps:
-  1. Confirm the configured `local_llm.mlx_run` path is executable.
-  2. Start the app with `./launch.sh`.
-  3. Focus a writable text field.
-  4. Hold `Command + Option`, dictate source information, release `Option` while holding `Command`, dictate a command, then release `Command`.
-  5. Confirm the generated result is pasted.
-  6. Repeat with `local_llm.enabled` set to `false` and confirm fallback text is pasted.
-- Latest result: pending.
-
-### Dump Mode
-
-- Feature coverage: `Control + Option` recording, transcription, Markdown inbox append, timestamp behavior.
-- Steps:
-  1. Start the app with `./launch.sh`.
-  2. Hold `Control + Option`, dictate a short note, then release both keys.
-  3. Confirm the configured Markdown inbox receives a new entry.
-- Latest result: pending.
-
-### Dump Command Mode
-
-- Feature coverage: two-segment dump workflow, local LLM command transformation, Markdown append.
-- Steps:
-  1. Confirm the configured `local_llm.mlx_run` path is executable.
-  2. Start the app with `./launch.sh`.
-  3. Hold `Control + Option`, dictate source information, release `Control` while holding `Option`, dictate a command, then release `Option`.
-  4. Confirm the generated result is appended to the Markdown inbox.
-- Latest result: pending.
-
-### macOS Permissions
-
-- Feature coverage: Microphone, Accessibility, and Input Monitoring requirements.
-- Steps:
-  1. Grant permissions to the terminal app that runs the binary.
-  2. Fully quit and reopen that terminal app.
-  3. Run paste and dump checks again.
-- Latest result: pending.
-
-### Recording Save Options
-
-- Feature coverage: `--save-recordings` and `--output-dir`.
-- Steps:
-  1. Start the app with `./launch.sh --save-recordings --output-dir recordings-test`.
-  2. Complete a short recording.
-  3. Confirm an audio file is kept in `recordings-test`.
-- Latest result: pending.
-
-### Greet Skill
-
-- Feature coverage: `greet` Codex skill and macOS text-to-speech through generic skill tool metadata.
-- Steps:
-  1. Run `FLUID_SKILL_INFORMATION='Dominik' python3 skills/greet/scripts/greet.py` in a logged-in macOS session.
-  2. Confirm the greeting is audible and the script prints `Spoken: Hello Dominik`.
-- Latest result: pending.
+- Select Markdown mode, record with 0/1/5 images, and verify the permanent files plus relative links in the note.
+- In two-stage Markdown mode, verify the provider sees text only while the note receives the result and images.
+- Select Hermes mode, record one instruction with 0/1/5 images, and verify native attachments, visible session, and result handoff.
+- Release Command first during `Command + Option` and verify it performs local dictation rather than Hermes.
+- Verify terminal `go`/`stop` remains text-only.
+- Verify ESP32 Bluetooth typing and routing.

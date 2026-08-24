@@ -1,16 +1,54 @@
 # App Behavior
 
-- `Command + Option`: record while both keys are held. System audio is muted while recording. If both keys are released together, transcribe and paste locally through `llm_output.paste`.
-- Bluetooth push-to-talk: disabled by default. If enabled in setup, the configured key records while held and delivers the transcript through `llm_output.bluetooth` when released.
-- `Command + Option`, then release `Option` while still holding `Command`: finish the information recording and immediately start recording a local command.
-- Release `Command`: transcribe both recordings, select matching local skills from `skills/*/SKILL.md`, run registered tool output such as Munich weather when selected, send the information, skill context, and command to the configured command LLM, then deliver the result through `llm_output.paste`. If the command segment is missing or empty, deliver the information transcript through the same configured output.
-- `Command + Option`, then release `Command` while still holding `Option`: finish the information recording and immediately start recording a Hermes Agent instruction.
-- Release `Option`: transcribe both recordings, enqueue the information transcript and Hermes instruction, immediately open or reuse a real Hermes/Poseidon Terminal session with `hermes --resume <session_id>`, visibly paste and submit the full prompt there, and keep new recordings available while Hermes works in that foreground UI. The final response is exported from the same session with `hermes sessions export --session-id ... -` and then pasted back into the original app or copied to the clipboard. Semantic follow-up/revision/reset/standalone decisions are delegated to Hermes, not local keyword filters. The old `tail -f` log Terminal and hidden user-turn `hermes chat -Q ... -q` path are not used as the completion UI.
-- `Control + Option`: record while both keys are held. If both keys are released together, transcribe and deliver the raw text through `llm_output.dump`.
-- `Control + Option`, then release `Control` while still holding `Option`: finish the dump information recording and immediately start recording a command.
-- Release `Option`: transcribe both dump recordings, select matching local skills, send the information, skill context, and command to the configured command LLM, then deliver the result through `llm_output.dump`. If the command segment is missing or empty, deliver the information transcript through the same configured output.
-- `llm_output.paste`, `llm_output.dump`, and `llm_output.bluetooth` accept `clipboard`, `dump`, or `bluetooth-keyboard`; defaults keep Command + Option local and leave Bluetooth disabled.
-- Terminal command `go`: start continuous recording inside the running app.
-- Terminal command `stop`: stop continuous recording, transcribe the full segment, and append it to the configured Obsidian daily note.
-- Terminal command input supports Tab autocomplete for `go`, `stop`, `status`, `help`, and `quit`.
-- Terminal continuous dump does not transcribe or write partial data before `stop`.
+## Shortcut State Transitions
+
+| Input | Result |
+| --- | --- |
+| Hold `Command + Option`, release both | Transcribe one segment locally and deliver through `llm_output.paste`. |
+| Tap physical `P` while the first `Command + Option` or `Control + Option` recording is active | Capture one ordered full-desktop screenshot; maximum five. |
+| Release `Option` while holding `Command` | Finish the information segment and start the instruction segment. No automatic screenshot occurs. |
+| Release `Command` after the transition | Send both transcripts plus zero to five captured images to the selected provider and deliver only a successful response. |
+| Release `Command` first while holding `Option` | Finish normal local dictation; Hermes no longer uses this gesture. |
+| Hold and release `Control + Option` in `dump` mode | Append the local transcript and captured images to Markdown. |
+| Release `Control` first in `dump` mode | Enter the two-stage Dump command path; images are archived in Markdown but not sent to the provider. |
+| Hold and release `Control + Option` in `hermes` mode | Send one spoken instruction and captured images to the visible Hermes session. |
+| Hold and release the configured Bluetooth key | Use the unchanged Bluetooth output path. |
+
+## `P` Screenshot Contract
+
+- `P` is recognized during first-segment `.recordingInformation` for `.paste` and `.dump`, never Bluetooth.
+- One physical key-down schedules one screenshot. Auto-repeat is ignored.
+- The matching key-up clears the latch and rearms capture.
+- Handled `P` key-down and key-up events do not reach the foreground app.
+- Captures stay ordered and stop at five; the sixth request is ignored.
+- Pressing `P` is optional. Paste commands send images to the provider, Dump archives them only in Markdown, and Hermes attaches them with native `/image` commands.
+- Transitioning to the instruction segment never triggers a screenshot itself.
+- Leaving the flow through local dictation, completion, error, or cancellation cleans temporary images.
+
+## Provider Behavior
+
+`command_provider` selects exactly one client:
+
+- `openai`: Responses API, `gpt-5.6-luna`, `reasoning.effort: low`, `text.verbosity: low`, `store: false`, and `detail: low` image inputs.
+- `cerebras`: Chat Completions, `gemma-4-31b`, with ordered image data URLs.
+
+The repository default is `openai`; this Mac's installed user config overrides it to `cerebras`. Keys come from the process environment or `.env` beside the active config.
+
+If a provider request fails, the app emits no command result. It does not call the other provider and does not deliver the information transcript as a provider-error fallback. If the instruction is empty before any request, it still delivers the information transcript.
+
+## Diagnostics and Failed-Turn Lifecycle
+
+For both providers, one logical `request_id` connects the request summary, image metadata, every attempt, retry decision, and terminal failure. Logs expose prompt lengths, image path/size/MIME/Base64 length/SHA-256, payload size/build time, configured timeout, attempt `n/max`, duration/outcome, HTTP status, response bytes, provider request ID, retry reason, and final `NSError` domain/code. They exclude API keys, `Authorization`, and raw Base64 content.
+
+On provider, Hermes, Markdown, or delivery failure, the app writes the newest failed turn to `~/Library/Application Support/fluid-push-to-talk/last-failed-command/`. The `0700` directory contains a `0600` `turn.json` and `0600` copies of captured images. A later failure replaces it through a staged backup-and-promote flow; startup recovery restores a valid backup after an interrupted promotion.
+
+The retained turn is cleared only after a later provider or Hermes response is delivered successfully. Local dictation, an empty command, and other unrelated flows do not clear it. A timeout retry remains visible as two attempt records joined by the same logical request ID and a `retry_reason=timeout` record.
+
+## Control + Option and Unchanged Paths
+
+- `control_option_mode` is `dump` or `hermes`; missing legacy values default to `dump`.
+- Markdown mode stores images under `attachments/YYYY-MM-DD/` beside the note and appends relative standard Markdown embeds after the text.
+- Hermes mode uses one transcript as the instruction, preserves Clipboard/session context, attaches images in order, and returns through the original app or Clipboard.
+- Continuous `go`/`stop` remains independent and text-only.
+- Bluetooth capture, serial transport, and delivery routing remain unchanged.
+- System audio ducking remains active during push-to-talk recording.

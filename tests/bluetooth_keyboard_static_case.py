@@ -16,9 +16,9 @@ def main() -> int:
     checks = [
         (config.get("llm_output") == {
             "paste": "clipboard",
-            "dump": "clipboard",
+            "dump": "dump",
             "bluetooth": "clipboard",
-         }, "Bluetooth output must stay local until the Bluetooth hotkey is explicitly enabled"),
+         }, "default outputs must keep paste/Bluetooth local and route Markdown mode to dump"),
         (config.get("hotkeys", {}).get("bluetooth", {}).get("keys")
          == [],
          "Bluetooth recording must default to disabled"),

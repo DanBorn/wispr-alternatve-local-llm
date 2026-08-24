@@ -6,11 +6,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_CONFIG = REPO_ROOT / "app" / "Sources" / "Config" / "AppConfig.swift"
+MARKDOWN_DUMPER = REPO_ROOT / "app" / "Sources" / "MarkdownDumper.swift"
 CONFIG_JSON = REPO_ROOT / "config" / "config.json"
 
 
 def main() -> int:
     source = APP_CONFIG.read_text(encoding="utf-8")
+    dumper = MARKDOWN_DUMPER.read_text(encoding="utf-8")
     config = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
     markdown_file = config["dump"]["markdown_file"]
 
@@ -34,6 +36,22 @@ def main() -> int:
         (
             'formatter.dateFormat = "yyyy-MM-dd"' in source,
             "DumpConfig must format daily note names as yyyy-MM-dd",
+        ),
+        (
+            'func dumpRaw(_ text: String, imageURLs: [URL])' in dumper,
+            "Markdown dumper must accept ordered image attachments",
+        ),
+        (
+            '"attachments/\\(dateFolder)/\\(filename)"' in dumper,
+            "Markdown attachments must use a relative date folder",
+        ),
+        (
+            '![Screenshot \\(index + 1)]' in dumper,
+            "Markdown entries must embed screenshots in capture order",
+        ),
+        (
+            "attachmentDateDirectoryExisted" in dumper and "copiedURLs" in dumper,
+            "failed Markdown writes must roll back new attachment files",
         ),
     ]
 

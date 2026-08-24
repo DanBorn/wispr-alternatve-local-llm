@@ -4,6 +4,48 @@ enum AppInfo {
     static let version = "0.2.3"
 }
 
+enum CommandProvider: String, Codable {
+    case openAI = "openai"
+    case cerebras
+
+    var displayName: String {
+        switch self {
+        case .openAI: return "OpenAI"
+        case .cerebras: return "Cerebras"
+        }
+    }
+
+    var model: String {
+        switch self {
+        case .openAI: return OpenAISecrets.model
+        case .cerebras: return CerebrasSecrets.model
+        }
+    }
+
+    var apiKeyEnvironmentName: String {
+        switch self {
+        case .openAI: return OpenAISecrets.apiKeyEnvironmentName
+        case .cerebras: return CerebrasSecrets.apiKeyEnvironmentName
+        }
+    }
+
+    func resolveAPIKey(configURL: URL) -> String {
+        ProviderSecrets.resolveAPIKey(named: apiKeyEnvironmentName, configURL: configURL)
+    }
+}
+
+enum ControlOptionMode: String, Codable {
+    case dump
+    case hermes
+
+    var displayName: String {
+        switch self {
+        case .dump: return "Markdown Dump"
+        case .hermes: return "Hermes Agent"
+        }
+    }
+}
+
 struct AppConfig: Codable {
     var promptConfigFile = "promptConfig.json"
     var textReplacementsFile = "textReplacements.json"
@@ -19,8 +61,8 @@ struct AppConfig: Codable {
     var hermesAgent = HermesAgentConfig()
     var llmOutput = LLMOutputConfig()
     var bluetoothKeyboard = BluetoothKeyboardConfig()
-    var skills = SkillsConfig()
-    var localLLM = LocalLLMConfig()
+    var commandProvider = CommandProvider.openAI
+    var controlOptionMode = ControlOptionMode.dump
     var prompts = PromptConfig()
     var textReplacements = TextReplacementConfig()
 
@@ -39,8 +81,8 @@ struct AppConfig: Codable {
         case hermesAgent = "hermes_agent"
         case llmOutput = "llm_output"
         case bluetoothKeyboard = "bluetooth_keyboard"
-        case skills
-        case localLLM = "local_llm"
+        case commandProvider = "command_provider"
+        case controlOptionMode = "control_option_mode"
     }
 
     init() {}
@@ -70,8 +112,14 @@ struct AppConfig: Codable {
             BluetoothKeyboardConfig.self,
             forKey: .bluetoothKeyboard
         ) ?? BluetoothKeyboardConfig()
-        skills = try container.decodeIfPresent(SkillsConfig.self, forKey: .skills) ?? SkillsConfig()
-        localLLM = try container.decodeIfPresent(LocalLLMConfig.self, forKey: .localLLM) ?? LocalLLMConfig()
+        commandProvider = try container.decodeIfPresent(
+            CommandProvider.self,
+            forKey: .commandProvider
+        ) ?? .openAI
+        controlOptionMode = try container.decodeIfPresent(
+            ControlOptionMode.self,
+            forKey: .controlOptionMode
+        ) ?? .dump
     }
 
     static func load(from url: URL?) throws -> AppConfig {
@@ -82,7 +130,6 @@ struct AppConfig: Codable {
                 preferredURL: config.promptConfigURL(relativeTo: configURL),
                 fallbackURL: Self.repositoryPromptConfigURL
             )
-            config.localLLM.resolveDotEnvFiles(relativeTo: configURL)
             config.textReplacements = try TextReplacementConfig.load(
                 preferredURL: config.textReplacementsURL(relativeTo: configURL),
                 fallbackURL: Self.repositoryTextReplacementsURL
@@ -97,7 +144,6 @@ struct AppConfig: Codable {
             preferredURL: config.promptConfigURL(relativeTo: configURL),
             fallbackURL: Self.repositoryPromptConfigURL
         )
-        config.localLLM.resolveDotEnvFiles(relativeTo: configURL)
         config.textReplacements = try TextReplacementConfig.load(
             preferredURL: config.textReplacementsURL(relativeTo: configURL),
             fallbackURL: Self.repositoryTextReplacementsURL
@@ -144,11 +190,9 @@ struct AppConfig: Codable {
 
 struct DebugConfig: Codable {
     var enabled = false
-    var logLLMRequests = false
 
     enum CodingKeys: String, CodingKey {
         case enabled
-        case logLLMRequests = "log_llm_requests"
     }
 }
 
@@ -244,7 +288,6 @@ struct AudioDuckingConfig: Codable {
 }
 
 struct HermesAgentConfig: Codable {
-    var enabled = true
     var executable = "hermes"
     var sessionName = "local-audio-voice-agent"
     var workdir = "~"
@@ -252,7 +295,6 @@ struct HermesAgentConfig: Codable {
     var timeoutSeconds: TimeInterval = 900
 
     enum CodingKeys: String, CodingKey {
-        case enabled
         case executable
         case sessionName = "session_name"
         case workdir
@@ -264,7 +306,6 @@ struct HermesAgentConfig: Codable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? enabled
         executable = try container.decodeIfPresent(String.self, forKey: .executable) ?? executable
         sessionName = try container.decodeIfPresent(String.self, forKey: .sessionName) ?? sessionName
         workdir = try container.decodeIfPresent(String.self, forKey: .workdir) ?? workdir
@@ -366,183 +407,38 @@ struct BluetoothKeyboardConfig: Codable {
     }
 }
 
-struct LocalLLMConfig: Codable {
-    enum Provider: String, Codable {
-        case mlx
-        case azureOpenAI = "azure_openai"
-        case openAICompatible = "openai_compatible"
-        case cerebras
+enum OpenAISecrets {
+    static let endpoint = URL(string: "https://api.openai.com/v1/responses")!
+    static let model = "gpt-5.6-luna"
+    static let reasoningEffort = "low"
+    static let imageDetail = "low"
+    static let apiKeyEnvironmentName = "OPENAI_API_KEY"
+
+    static func resolveAPIKey(configURL: URL) -> String {
+        ProviderSecrets.resolveAPIKey(named: apiKeyEnvironmentName, configURL: configURL)
     }
+}
 
-    var enabled = true
-    var commandGenerationEnabled = true
-    var provider = Provider.mlx
-    var mlxRun = "mlx-run"
-    var llmTool = "llm-tool"
-    var download = "~/Library/Application Support/FluidPushToTalk/Models"
-    var model = "prism-ml/Ternary-Bonsai-8B-mlx-2bit"
-    var endpoint = ""
-    var baseURL = ""
-    var apiKeyEnv = "OPENAI_API_KEY"
-    var dotenvFile = ".env"
-    private var dotenvURLs: [URL] = []
-    var temperature = 0.0
-    var topP: Double?
-    var maxTokens = 96
-    var imageContextEnabled = false
-    var cacheSize = 4096
-    var memorySize = 4096
-    var timeoutSeconds: TimeInterval = 30
-    var requestTimeoutSeconds: TimeInterval = 8
-    var maxRetries = 1
+enum CerebrasSecrets {
+    static let model = "gemma-4-31b"
+    static let apiKeyEnvironmentName = "CEREBRAS_API_KEY"
 
-    enum CodingKeys: String, CodingKey {
-        case enabled
-        case commandGenerationEnabled = "command_generation_enabled"
-        case provider
-        case mlxRun = "mlx_run"
-        case llmTool = "llm_tool"
-        case download
-        case model
-        case endpoint
-        case baseURL = "base_url"
-        case apiKeyEnv = "api_key_env"
-        case dotenvFile = "dotenv_file"
-        case temperature
-        case topP = "top_p"
-        case maxTokens = "max_tokens"
-        case imageContextEnabled = "image_context_enabled"
-        case cacheSize = "cache_size"
-        case memorySize = "memory_size"
-        case timeoutSeconds = "timeout_seconds"
-        case requestTimeoutSeconds = "request_timeout_seconds"
-        case maxRetries = "max_retries"
+    static func resolveAPIKey(configURL: URL) -> String {
+        ProviderSecrets.resolveAPIKey(named: apiKeyEnvironmentName, configURL: configURL)
     }
+}
 
-    init() {}
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? enabled
-        commandGenerationEnabled = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .commandGenerationEnabled
-        ) ?? commandGenerationEnabled
-        provider = try container.decodeIfPresent(Provider.self, forKey: .provider) ?? provider
-        mlxRun = try container.decodeIfPresent(String.self, forKey: .mlxRun) ?? mlxRun
-        llmTool = try container.decodeIfPresent(String.self, forKey: .llmTool) ?? llmTool
-        download = try container.decodeIfPresent(String.self, forKey: .download) ?? download
-        if let decodedModel = try container.decodeIfPresent(String.self, forKey: .model),
-           !decodedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            model = decodedModel
-        }
-        endpoint = try container.decodeIfPresent(String.self, forKey: .endpoint) ?? endpoint
-        baseURL = try container.decodeIfPresent(String.self, forKey: .baseURL) ?? baseURL
-        apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv) ?? apiKeyEnv
-        dotenvFile = try container.decodeIfPresent(String.self, forKey: .dotenvFile) ?? dotenvFile
-        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? temperature
-        topP = try container.decodeIfPresent(Double.self, forKey: .topP) ?? topP
-        maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? maxTokens
-        imageContextEnabled = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .imageContextEnabled
-        ) ?? imageContextEnabled
-        cacheSize = try container.decodeIfPresent(Int.self, forKey: .cacheSize) ?? cacheSize
-        memorySize = try container.decodeIfPresent(Int.self, forKey: .memorySize) ?? memorySize
-        timeoutSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .timeoutSeconds) ?? timeoutSeconds
-        requestTimeoutSeconds = try container.decodeIfPresent(
-            TimeInterval.self,
-            forKey: .requestTimeoutSeconds
-        ) ?? requestTimeoutSeconds
-        maxRetries = try container.decodeIfPresent(Int.self, forKey: .maxRetries) ?? maxRetries
-    }
-
-    var mlxRunURL: URL {
-        URL(fileURLWithPath: mlxRun.expandingTilde)
-    }
-
-    var canGenerateCommands: Bool {
-        enabled && commandGenerationEnabled
-    }
-
-    var llmToolURL: URL? {
-        let path = llmTool.expandingTilde
-        guard !path.isEmpty else {
-            return nil
-        }
-        return URL(fileURLWithPath: path)
-    }
-
-    var chatCompletionsURL: URL? {
-        let rawURL: String
-        switch provider {
-        case .openAICompatible, .cerebras:
-            rawURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? endpoint : baseURL
-        case .azureOpenAI, .mlx:
-            rawURL = endpoint
-        }
-
-        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-        guard var components = URLComponents(string: trimmed) else {
-            return nil
-        }
-        if !components.path.hasSuffix("/chat/completions") {
-            let normalizedPath = components.path
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            components.path = normalizedPath.isEmpty
-                ? "/chat/completions"
-                : "/\(normalizedPath)/chat/completions"
-        }
-        return components.url
-    }
-
-    var resolvedAPIKey: String {
-        let keyName = apiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !keyName.isEmpty else {
-            return ""
-        }
-        if let environmentValue = ProcessInfo.processInfo.environment[keyName]?
+private enum ProviderSecrets {
+    static func resolveAPIKey(named name: String, configURL: URL) -> String {
+        if let environmentValue = ProcessInfo.processInfo.environment[name]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !environmentValue.isEmpty {
             return environmentValue
         }
-        for dotenvURL in dotenvURLs {
-            if let value = DotEnvFile.loadValue(named: keyName, from: dotenvURL),
-               !value.isEmpty {
-                return value
-            }
-        }
-        return ""
-    }
-
-    mutating func resolveDotEnvFiles(relativeTo configURL: URL) {
-        let configuredPath = dotenvFile.expandingTilde
-        let configuredURL: URL
-        if configuredPath.isAbsolutePath {
-            configuredURL = URL(fileURLWithPath: configuredPath)
-        } else {
-            configuredURL = configURL.deletingLastPathComponent().appendingPathComponent(configuredPath)
-        }
-        dotenvURLs = uniqueURLs([
-            configuredURL,
-            AppConfig.repositoryRootURL.appendingPathComponent(".env"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".env"),
-        ])
-    }
-
-    private func uniqueURLs(_ urls: [URL]) -> [URL] {
-        var seen = Set<String>()
-        return urls.filter { url in
-            let path = url.standardizedFileURL.path
-            guard !seen.contains(path) else {
-                return false
-            }
-            seen.insert(path)
-            return true
-        }
+        return DotEnvFile.loadValue(
+            named: name,
+            from: configURL.deletingLastPathComponent().appendingPathComponent(".env")
+        ) ?? ""
     }
 }
 

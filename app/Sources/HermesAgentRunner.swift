@@ -10,6 +10,7 @@ struct HermesAgentResult {
 
 private struct HermesTerminalSessionState: Codable {
     let sessionName: String
+    let sessionID: String?
     let windowID: Int
     let tabIndex: Int
     let marker: String
@@ -50,18 +51,14 @@ final class HermesAgentRunner: @unchecked Sendable {
         self.config = config
     }
 
-    func run(information: String, instruction: String, screenshotURL: URL?) async throws -> HermesAgentResult {
-        guard config.enabled else {
-            throw CliError.invalidValue("Hermes agent mode is disabled in config")
-        }
-
+    func run(information: String, instruction: String, imageURLs: [URL]) async throws -> HermesAgentResult {
         let clipboard = currentClipboardText()
         let runID = Self.makeRunID()
         let prompt = Self.makePrompt(
             information: information,
             instruction: instruction,
             clipboard: clipboard,
-            screenshotURL: screenshotURL,
+            imageURLs: imageURLs,
             runID: runID
         )
         let logURL = try ensureLogFile()
@@ -70,11 +67,12 @@ final class HermesAgentRunner: @unchecked Sendable {
         try appendLog("[information]\n\(information.isEmpty ? "[empty]" : information)\n\n", to: logURL)
         try appendLog("[instruction]\n\(instruction.isEmpty ? "[empty]" : instruction)\n\n", to: logURL)
         try appendLog("[clipboard]\n\(clipboard.isEmpty ? "[empty]" : clipboard)\n\n", to: logURL)
+        try appendLog("[images]\n\(imageURLs.isEmpty ? "[none]" : imageURLs.map(\.path).joined(separator: "\n"))\n\n", to: logURL)
 
         do {
             let sessionID = try ensureNamedVoiceSession(logURL: logURL)
             try appendLog("[command]\nforeground Hermes --resume \(sessionID), paste prompt, wait for exported response\n\n", to: logURL)
-            try foregroundSessionAndSubmit(prompt: prompt, sessionID: sessionID)
+            try foregroundSessionAndSubmit(prompt: prompt, imageURLs: imageURLs, sessionID: sessionID)
             try appendLog("[foreground]\nHermes opened in foreground and prompt submitted.\n\n", to: logURL)
             fputs("Hermes opened in foreground; waiting for visible session response\n", stderr)
             let output = try waitForAssistantOutput(sessionID: sessionID, runID: runID, logURL: logURL)
@@ -96,7 +94,7 @@ final class HermesAgentRunner: @unchecked Sendable {
         information: String,
         instruction: String,
         clipboard: String,
-        screenshotURL: URL?,
+        imageURLs: [URL],
         runID: String
     ) -> String {
         """
@@ -112,7 +110,7 @@ final class HermesAgentRunner: @unchecked Sendable {
         \(clipboard.isEmpty ? "[Clipboard is empty or does not contain plain text.]" : clipboard)
 
         Screenshot context:
-        \(screenshotURL?.path ?? "[No screenshot was captured.]")
+        \(imageURLs.isEmpty ? "[No screenshot was captured.]" : imageURLs.map(\.path).joined(separator: "\n"))
 
         User instruction:
         \(instruction)
@@ -149,14 +147,23 @@ final class HermesAgentRunner: @unchecked Sendable {
         }
     }
 
-    private func foregroundSessionAndSubmit(prompt: String, sessionID: String) throws {
+    static func nativeImageCommands(for imageURLs: [URL]) -> [String] {
+        imageURLs.map { url in
+            let escapedPath = url.path
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "/image \"\(escapedPath)\""
+        }
+    }
+
+    private func foregroundSessionAndSubmit(prompt: String, imageURLs: [URL], sessionID: String) throws {
         copyPromptToClipboard(prompt)
         guard config.foregroundTerminal else {
             throw CliError.invalidValue("Hermes foreground Terminal is disabled; prompt copied to clipboard")
         }
 
-        let marker = currentInteractiveSessionMarker()
-        let state = loadTerminalSessionState(expectedMarker: marker)
+        let marker = currentInteractiveSessionMarker(sessionID: sessionID)
+        let state = loadTerminalSessionState(expectedMarker: marker, expectedSessionID: sessionID)
         let escapedMarker = appleScriptString(marker)
         let expectedWindowID = state?.windowID ?? 0
         let expectedTabIndex = state?.tabIndex ?? 0
@@ -259,26 +266,42 @@ final class HermesAgentRunner: @unchecked Sendable {
           set scriptOutput to (foundWindowID as text) & "|" & (foundTabIndex as text) & "|" & (sessionReady as text)
         end tell
 
-        if sessionReady then
-          tell application "System Events"
-            tell process "Terminal"
-              set frontmost to true
-              keystroke "v" using command down
-              key code 36
-            end tell
-          end tell
-        end if
-
         return scriptOutput
         """
 
         guard let output = runAppleScript(script) else {
             throw CliError.invalidValue("Hermes foreground prompt paste failed; prompt copied to clipboard")
         }
-        saveTerminalSessionState(from: output, marker: marker)
+        saveTerminalSessionState(from: output, marker: marker, sessionID: sessionID)
         let parts = output.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard parts.indices.contains(2), parts[2] == "true" else {
             throw CliError.invalidValue("Hermes foreground session did not become ready; prompt copied to clipboard")
+        }
+        do {
+            for command in Self.nativeImageCommands(for: imageURLs) {
+                try pasteAndSubmitInForegroundTerminal(command)
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+            try pasteAndSubmitInForegroundTerminal(prompt)
+        } catch {
+            copyPromptToClipboard(prompt)
+            throw error
+        }
+    }
+
+    private func pasteAndSubmitInForegroundTerminal(_ text: String) throws {
+        copyPromptToClipboard(text)
+        let script = """
+        tell application "System Events"
+          tell process "Terminal"
+            set frontmost to true
+            keystroke "v" using command down
+            key code 36
+          end tell
+        end tell
+        """
+        guard runAppleScript(script) != nil else {
+            throw CliError.invalidValue("Hermes foreground input submission failed")
         }
     }
 
@@ -315,7 +338,7 @@ final class HermesAgentRunner: @unchecked Sendable {
             arguments: [config.executable, "sessions", "export", "--session-id", sessionID, "-"],
             timeout: min(10, config.timeoutSeconds)
         )
-        guard let exported = decodeSessionExport(stdout) else {
+        guard let exported = Self.decodeSessionExport(stdout) else {
             return nil
         }
         guard let userIndex = exported.messages.lastIndex(where: {
@@ -335,7 +358,11 @@ final class HermesAgentRunner: @unchecked Sendable {
         return nil
     }
 
-    private func decodeSessionExport(_ raw: String) -> HermesSessionExport? {
+    static func isValidSessionExport(_ raw: String) -> Bool {
+        decodeSessionExport(raw) != nil
+    }
+
+    private static func decodeSessionExport(_ raw: String) -> HermesSessionExport? {
         let decoder = JSONDecoder()
         if let data = raw.data(using: .utf8),
            let exported = try? decoder.decode(HermesSessionExport.self, from: data) {
@@ -364,7 +391,7 @@ final class HermesAgentRunner: @unchecked Sendable {
         guard config.foregroundTerminal else {
             return
         }
-        let marker = currentInteractiveSessionMarker()
+        let marker = currentInteractiveSessionMarker(sessionID: sessionID)
         let command = interactiveSessionCommand(marker: marker, sessionID: sessionID)
         let escapedCommand = appleScriptString(command)
         let script = """
@@ -379,25 +406,30 @@ final class HermesAgentRunner: @unchecked Sendable {
         guard let output = runAppleScript(script) else {
             return
         }
-        saveTerminalSessionState(from: output, marker: marker)
+        saveTerminalSessionState(from: output, marker: marker, sessionID: sessionID)
     }
 
     private func ensureInteractiveSession(foreground: Bool) {
         guard config.foregroundTerminal else {
             return
         }
+        let sessionID: String?
         do {
-            try ensureNamedVoiceSession()
+            sessionID = try ensureNamedVoiceSession()
         } catch {
+            sessionID = nil
             fputs("Hermes named session bootstrap failed: \(error)\n", stderr)
         }
-        let desiredMarker = currentInteractiveSessionMarker()
-        let state = loadTerminalSessionState(expectedMarker: desiredMarker)
+        let desiredMarker = currentInteractiveSessionMarker(sessionID: sessionID)
+        let state = loadTerminalSessionState(
+            expectedMarker: desiredMarker,
+            expectedSessionID: sessionID
+        )
         let marker = state?.marker ?? desiredMarker
         let escapedMarker = appleScriptString(marker)
         let expectedWindowID = state?.windowID ?? 0
         let expectedTabIndex = state?.tabIndex ?? 0
-        let command = interactiveSessionCommand(marker: marker, sessionID: nil)
+        let command = interactiveSessionCommand(marker: marker, sessionID: sessionID)
         let escapedCommand = appleScriptString(command)
         let shouldForeground = foreground ? "true" : "false"
         let previousFrontBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
@@ -499,7 +531,7 @@ final class HermesAgentRunner: @unchecked Sendable {
         guard let output = runAppleScript(script) else {
             return
         }
-        saveTerminalSessionState(from: output, marker: marker)
+        saveTerminalSessionState(from: output, marker: marker, sessionID: sessionID)
         if !foreground, let previousBundleID = terminalSessionOutputParts(output).previousBundleID {
             reactivateApplication(bundleIdentifier: previousBundleID)
         }
@@ -549,20 +581,28 @@ final class HermesAgentRunner: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func loadTerminalSessionState(expectedMarker: String) -> HermesTerminalSessionState? {
+    private func loadTerminalSessionState(
+        expectedMarker: String,
+        expectedSessionID: String?
+    ) -> HermesTerminalSessionState? {
         let url = terminalSessionStateURL()
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let data = try? Data(contentsOf: url),
               let state = try? decoder.decode(HermesTerminalSessionState.self, from: data),
               state.sessionName == config.sessionName,
-              state.marker == expectedMarker else {
+              state.marker == expectedMarker,
+              state.sessionID == expectedSessionID else {
             return nil
         }
         return state
     }
 
-    private func saveTerminalSessionState(from output: String, marker: String) {
+    private func saveTerminalSessionState(
+        from output: String,
+        marker: String,
+        sessionID: String?
+    ) {
         let parts = terminalSessionOutputParts(output)
         guard let windowID = parts.windowID,
               let tabIndex = parts.tabIndex,
@@ -572,6 +612,7 @@ final class HermesAgentRunner: @unchecked Sendable {
         }
         let state = HermesTerminalSessionState(
             sessionName: config.sessionName,
+            sessionID: sessionID,
             windowID: windowID,
             tabIndex: tabIndex,
             marker: marker,
@@ -592,10 +633,13 @@ final class HermesAgentRunner: @unchecked Sendable {
     @discardableResult
     private func ensureNamedVoiceSession(logURL: URL? = nil) throws -> String {
         if let sessionID = loadVoiceSessionID() {
-            if let logURL {
-                try? appendLog("[session]\ncontinuing named Hermes session \(config.sessionName) (\(sessionID))\n\n", to: logURL)
+            if validateVoiceSessionID(sessionID, logURL: logURL) {
+                if let logURL {
+                    try? appendLog("[session]\ncontinuing named Hermes session \(config.sessionName) (\(sessionID))\n\n", to: logURL)
+                }
+                return sessionID
             }
-            return sessionID
+            removeVoiceSessionState()
         }
 
         if let sessionID = findNamedVoiceSessionID(logURL: logURL) {
@@ -629,6 +673,32 @@ final class HermesAgentRunner: @unchecked Sendable {
             return listedSessionID
         }
         return sessionID
+    }
+
+    private func validateVoiceSessionID(_ sessionID: String, logURL: URL?) -> Bool {
+        do {
+            let (stdout, _) = try runHermesProcess(
+                arguments: [config.executable, "sessions", "export", "--session-id", sessionID, "-"],
+                timeout: min(10, config.timeoutSeconds)
+            )
+            return Self.isValidSessionExport(stdout)
+        } catch {
+            if let logURL {
+                try? appendLog("[stale session]\n\(sessionID): \(error)\n\n", to: logURL)
+            }
+            return false
+        }
+    }
+
+    private func removeVoiceSessionState() {
+        do {
+            let url = voiceSessionStateURL()
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+        } catch {
+            fputs("Hermes stale voice session state cleanup failed: \(error)\n", stderr)
+        }
     }
 
     private func findNamedVoiceSessionID(logURL: URL?) -> String? {
@@ -706,8 +776,8 @@ final class HermesAgentRunner: @unchecked Sendable {
         return (stdout, stderr)
     }
 
-    private func currentInteractiveSessionMarker() -> String {
-        "__LOCAL_AUDIO_HERMES_SESSION__: \(config.sessionName):named"
+    private func currentInteractiveSessionMarker(sessionID: String?) -> String {
+        "__LOCAL_AUDIO_HERMES_SESSION__: \(config.sessionName):\(sessionID ?? "named")"
     }
 
     private func extractSessionID(from stderr: String) -> String? {

@@ -46,6 +46,33 @@ struct DeliveryTiming {
     }
 }
 
+enum DeliveryOutcome: Equatable {
+    case delivered
+    case skipped(reason: String)
+}
+
+enum DeliveryPermission: Equatable {
+    case allowed
+    case skipped(reason: String)
+}
+
+enum DeliveryPolicy {
+    static func permission(
+        for method: LLMOutputMethod,
+        pasteEnabled: Bool,
+        dumpEnabled: Bool
+    ) -> DeliveryPermission {
+        switch method {
+        case .clipboard:
+            return pasteEnabled ? .allowed : .skipped(reason: "clipboard paste is disabled")
+        case .dump:
+            return dumpEnabled ? .allowed : .skipped(reason: "markdown dump is disabled")
+        case .bluetoothKeyboard:
+            return .allowed
+        }
+    }
+}
+
 private final class MicrophonePermissionResult: @unchecked Sendable {
     private let lock = NSLock()
     private var granted = false
@@ -418,6 +445,11 @@ final class PasteboardTyper: @unchecked Sendable {
 }
 
 final class PushToTalkController: @unchecked Sendable {
+    private static let screenshotDirectoryURL = URL(
+        fileURLWithPath: "~/Library/Application Support/fluid-push-to-talk/screenshots".expandingTilde,
+        isDirectory: true
+    )
+
     private let options: Options
     private let recorder: AudioRecorder
     private let transcriber: FluidTranscriber
@@ -425,19 +457,19 @@ final class PushToTalkController: @unchecked Sendable {
     private let dumper: MarkdownDumper
     private let bluetoothKeyboard: BluetoothKeyboardOutput
     private let commandGenerator: CommandResultGenerator
+    private let failedCommandTurnStore: FailedCommandTurnStore
     private let hermesRunner: HermesAgentRunner
-    private let llmReadinessMonitor: LocalLLMReadinessMonitor
     private let textReplacer: TextReplacementService
     private let audioDucker = SystemAudioDucker()
     private let stateQueue = DispatchQueue(label: "fluid-push-to-talk.state")
     private let hermesJobQueue = DispatchQueue(label: "fluid-push-to-talk.hermes-jobs")
     private let hermesJobIDLock = NSLock()
     private let commandModeGrace: TimeInterval = 0.15
+    private let maximumCommandScreenshots = 5
     private var recordingState = RecordingState.idle
     private var transcribing = false
     private var nextHermesJobID = 1
     private var pendingContinuation: DispatchWorkItem?
-    private var pendingHermesContinuation: DispatchWorkItem?
     private var audioDuckingActive = false
     private var activeInteractionStartedAt: Date?
     private var activeInteractionTargetBundleIdentifier: String?
@@ -452,7 +484,7 @@ final class PushToTalkController: @unchecked Sendable {
         dumper: MarkdownDumper,
         bluetoothKeyboard: BluetoothKeyboardOutput,
         commandGenerator: CommandResultGenerator,
-        llmReadinessMonitor: LocalLLMReadinessMonitor
+        failedCommandTurnStore: FailedCommandTurnStore = FailedCommandTurnStore()
     ) {
         self.options = options
         self.recorder = recorder
@@ -461,9 +493,10 @@ final class PushToTalkController: @unchecked Sendable {
         self.dumper = dumper
         self.bluetoothKeyboard = bluetoothKeyboard
         self.commandGenerator = commandGenerator
+        self.failedCommandTurnStore = failedCommandTurnStore
         hermesRunner = HermesAgentRunner(config: options.config.hermesAgent)
-        self.llmReadinessMonitor = llmReadinessMonitor
         textReplacer = TextReplacementService(config: options.config.textReplacements)
+        cleanupStaleScreenContexts()
     }
 
     func handle(flags: CGEventFlags) {
@@ -475,6 +508,12 @@ final class PushToTalkController: @unchecked Sendable {
     func handleBluetoothChord(isPressed: Bool) {
         stateQueue.async {
             self.handleBluetoothChordLocked(isPressed: isPressed)
+        }
+    }
+
+    func captureCommandScreenshot() -> Bool {
+        stateQueue.sync {
+            captureCommandScreenshotLocked()
         }
     }
 
@@ -492,44 +531,75 @@ final class PushToTalkController: @unchecked Sendable {
         case .idle:
             cancelPendingContinuation()
             if let action {
-                startRecording(state: .recordingInformation(action: action), label: "\(action.displayName) information")
+                startRecording(
+                    state: .recordingInformation(action: action, screenshotTasks: []),
+                    label: "\(action.displayName) information"
+                )
             }
-        case let .recordingInformation(activeAction):
+        case let .recordingInformation(activeAction, screenshotTasks):
             guard activeAction != .bluetooth else {
                 return
             }
-            let continuation = options.config.hotkeys.isContinuationPressed(for: activeAction, in: flags)
-            let hermesContinuation = options.config.hermesAgent.enabled
-                && options.config.hotkeys.isHermesAgentContinuationPressed(for: activeAction, in: flags)
+            let isOneSegmentHermes = RecordingRoutePolicy.isOneSegmentHermes(
+                action: activeAction,
+                mode: options.config.controlOptionMode
+            )
+            let continuation = !isOneSegmentHermes
+                && options.config.hotkeys.isContinuationPressed(for: activeAction, in: flags)
             if continuation {
-                cancelPendingHermesContinuation()
                 scheduleContinuationConfirmation(for: activeAction)
                 return
             }
-            if hermesContinuation {
-                cancelPendingCommandContinuation()
-                scheduleHermesContinuationConfirmation(for: activeAction)
-                return
-            }
-            if action != activeAction, !continuation, !hermesContinuation {
+            if action != activeAction, !continuation {
                 cancelPendingContinuation()
                 recordingState = .idle
-                stopAndTranscribe(action: activeAction)
+                if isOneSegmentHermes {
+                    stopAndRunHermesAgent(screenshotTasks: screenshotTasks)
+                } else {
+                    stopAndTranscribe(action: activeAction, screenshotTasks: screenshotTasks)
+                }
             }
-        case let .recordingInstruction(activeAction, informationURL, imageURL):
+        case let .recordingInstruction(activeAction, informationURL, screenshotTasks):
             cancelPendingContinuation()
             if !options.config.hotkeys.isContinuationPressed(for: activeAction, in: flags) {
                 recordingState = .idle
-                stopAndGenerateCommandResult(action: activeAction, informationURL: informationURL, imageURL: imageURL)
-            }
-        case let .recordingHermesInstruction(informationURL, screenshotURL):
-            cancelPendingContinuation()
-            if !options.config.hermesAgent.enabled
-                || !options.config.hotkeys.isHermesAgentContinuationPressed(for: .paste, in: flags) {
-                recordingState = .idle
-                stopAndRunHermesAgent(informationURL: informationURL, screenshotURL: screenshotURL)
+                stopAndGenerateCommandResult(
+                    action: activeAction,
+                    informationURL: informationURL,
+                    screenshotTasks: screenshotTasks
+                )
             }
         }
+    }
+
+    private func captureCommandScreenshotLocked() -> Bool {
+        guard case let .recordingInformation(action, screenshotTasks) = recordingState,
+              RecordingRoutePolicy.supportsScreenshots(action: action) else {
+            return false
+        }
+        guard screenshotTasks.count < maximumCommandScreenshots else {
+            log("Bildlimit erreicht (\(maximumCommandScreenshots)/\(maximumCommandScreenshots))")
+            return true
+        }
+
+        let previousTask = screenshotTasks.last
+        let pictureNumber = screenshotTasks.count + 1
+        let screenshotTask: Task<URL?, Never> = Task.detached(priority: .userInitiated) { [weak self] in
+            _ = await previousTask?.value
+            guard let self else {
+                return nil
+            }
+            let url = self.captureCommandImageContext()
+            if url != nil {
+                log("Bild \(pictureNumber)/\(self.maximumCommandScreenshots) erfasst")
+            }
+            return url
+        }
+        recordingState = .recordingInformation(
+            action: action,
+            screenshotTasks: screenshotTasks + [screenshotTask]
+        )
+        return true
     }
 
     private func handleBluetoothChordLocked(isPressed: Bool) {
@@ -540,12 +610,12 @@ final class PushToTalkController: @unchecked Sendable {
         switch recordingState {
         case .idle where isPressed:
             startRecording(
-                state: .recordingInformation(action: .bluetooth),
+                state: .recordingInformation(action: .bluetooth, screenshotTasks: []),
                 label: "bluetooth information"
             )
-        case .recordingInformation(action: .bluetooth) where !isPressed:
+        case .recordingInformation(action: .bluetooth, screenshotTasks: _) where !isPressed:
             recordingState = .idle
-            stopAndTranscribe(action: .bluetooth)
+            stopAndTranscribe(action: .bluetooth, screenshotTasks: [])
         default:
             return
         }
@@ -628,7 +698,7 @@ final class PushToTalkController: @unchecked Sendable {
 
     private func confirmContinuation(for action: HotkeyAction) {
         pendingContinuation = nil
-        guard case let .recordingInformation(activeAction) = recordingState,
+        guard case let .recordingInformation(activeAction, screenshotTasks) = recordingState,
               activeAction == action else {
             return
         }
@@ -636,16 +706,18 @@ final class PushToTalkController: @unchecked Sendable {
             recordingState = .idle
             endAudioDuckingIfNeeded()
             resetDeliveryTiming()
+            Task {
+                await cleanupCommandScreenshotTasks(screenshotTasks)
+            }
             return
         }
         addAudioDuration(from: informationURL, label: "information")
-        let imageURL = captureCommandImageContext()
         do {
             try recorder.start()
             recordingState = .recordingInstruction(
                 action: activeAction,
                 informationURL: informationURL,
-                imageURL: imageURL
+                screenshotTasks: screenshotTasks
             )
             log("recording command...")
         } catch {
@@ -654,68 +726,19 @@ final class PushToTalkController: @unchecked Sendable {
             resetDeliveryTiming()
             fputs("recording failed: \(error)\n", stderr)
             try? preserveOrDeleteRecording(informationURL)
-            try? removeScreenContext(imageURL)
-        }
-    }
-
-    private func scheduleHermesContinuationConfirmation(for action: HotkeyAction) {
-        guard pendingHermesContinuation == nil else {
-            return
-        }
-
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.confirmHermesContinuation(for: action)
-        }
-        pendingHermesContinuation = workItem
-        stateQueue.asyncAfter(deadline: .now() + commandModeGrace, execute: workItem)
-    }
-
-    private func confirmHermesContinuation(for action: HotkeyAction) {
-        pendingHermesContinuation = nil
-        guard options.config.hermesAgent.enabled,
-              action == .paste,
-              case let .recordingInformation(activeAction) = recordingState,
-              activeAction == action else {
-            return
-        }
-        guard let informationURL = recorder.stop() else {
-            recordingState = .idle
-            endAudioDuckingIfNeeded()
-            resetDeliveryTiming()
-            return
-        }
-        addAudioDuration(from: informationURL, label: "information")
-        let screenshotURL = captureHermesScreenContext()
-        do {
-            try recorder.start()
-            recordingState = .recordingHermesInstruction(
-                informationURL: informationURL,
-                screenshotURL: screenshotURL
-            )
-            log("recording Hermes instruction...")
-        } catch {
-            recordingState = .idle
-            endAudioDuckingIfNeeded()
-            resetDeliveryTiming()
-            fputs("Hermes instruction recording failed: \(error)\n", stderr)
-            try? preserveOrDeleteRecording(informationURL)
-            try? removeHermesScreenshot(screenshotURL)
+            Task {
+                await cleanupCommandScreenshotTasks(screenshotTasks)
+            }
         }
     }
 
     private func cancelPendingContinuation() {
         cancelPendingCommandContinuation()
-        cancelPendingHermesContinuation()
     }
 
     private func cancelPendingCommandContinuation() {
         pendingContinuation?.cancel()
         pendingContinuation = nil
-    }
-
-    private func cancelPendingHermesContinuation() {
-        pendingHermesContinuation?.cancel()
-        pendingHermesContinuation = nil
     }
 
     private func startRecording(state: RecordingState, label: String) {
@@ -727,7 +750,6 @@ final class PushToTalkController: @unchecked Sendable {
             beginAudioDuckingIfNeeded()
             recordingState = state
             log("recording \(label)...")
-            llmReadinessMonitor.warmUpInBackground(reason: "recording started")
         } catch {
             endAudioDuckingIfNeeded()
             resetDeliveryTiming()
@@ -751,10 +773,16 @@ final class PushToTalkController: @unchecked Sendable {
         audioDucker.end()
     }
 
-    private func stopAndTranscribe(action: HotkeyAction?) {
+    private func stopAndTranscribe(
+        action: HotkeyAction?,
+        screenshotTasks: [Task<URL?, Never>] = []
+    ) {
         guard let url = recorder.stop() else {
             endAudioDuckingIfNeeded()
             resetDeliveryTiming()
+            Task {
+                await cleanupCommandScreenshotTasks(screenshotTasks)
+            }
             return
         }
         endAudioDuckingIfNeeded()
@@ -765,24 +793,49 @@ final class PushToTalkController: @unchecked Sendable {
         log("transcribing...")
 
         Task {
+            let imageURLs = await resolveCommandScreenshotTasks(screenshotTasks)
             do {
                 let text = try await transcribeAndRewrite(url: url)
                 log("\n[final] \(text.isEmpty ? "[no speech detected]" : text)\n")
                 if let action, !text.isEmpty {
                     do {
-                        try await deliverResult(
+                        let dumpImages = RecordingRoutePolicy.deliveryImages(action: action, images: imageURLs)
+                        let outcome = try await deliverResult(
                             text,
                             action: action,
                             timing: timing,
-                            logAsResult: false
+                            logAsResult: false,
+                            imageURLs: dumpImages
                         )
+                        guard outcome == .delivered else {
+                            throw CliError.invalidValue("output delivery was skipped: \(outcome)")
+                        }
+                        cleanupCommandScreenshotURLs(imageURLs)
                     } catch {
                         fputs("output delivery failed: \(error)\n", stderr)
+                        if action == .dump {
+                            let retained = retainFailedInteraction(
+                                provider: "Markdown",
+                                model: "local-dump",
+                                information: text,
+                                command: "",
+                                error: error,
+                                imageURLs: imageURLs
+                            )
+                            if retained {
+                                cleanupCommandScreenshotURLs(imageURLs)
+                            }
+                        } else {
+                            cleanupCommandScreenshotURLs(imageURLs)
+                        }
                     }
+                } else {
+                    cleanupCommandScreenshotURLs(imageURLs)
                 }
                 try preserveOrDeleteRecording(url)
             } catch {
                 fputs("transcription failed: \(error)\n", stderr)
+                cleanupCommandScreenshotURLs(imageURLs)
             }
 
             stateQueue.async {
@@ -792,18 +845,29 @@ final class PushToTalkController: @unchecked Sendable {
         }
     }
 
-    private func stopAndGenerateCommandResult(action: HotkeyAction, informationURL: URL, imageURL: URL?) {
+    private func stopAndGenerateCommandResult(
+        action: HotkeyAction,
+        informationURL: URL,
+        screenshotTasks: [Task<URL?, Never>]
+    ) {
         guard let commandURL = recorder.stop() else {
             endAudioDuckingIfNeeded()
             let timing = deliveryTimingSnapshot()
             transcribing = true
             log("no command recording found; transcribing information...")
             Task {
-                defer {
-                    try? removeScreenContext(imageURL)
-                }
+                async let capturedImageURLs = resolveCommandScreenshotTasks(screenshotTasks)
                 let information = await transcribeSegment(url: informationURL, label: "information")
-                await deliverInformationFallback(information, action: action, timing: timing)
+                let imageURLs = await capturedImageURLs
+                let canCleanupImages = await deliverInformationFallback(
+                    information,
+                    action: action,
+                    timing: timing,
+                    imageURLs: RecordingRoutePolicy.deliveryImages(action: action, images: imageURLs)
+                )
+                if canCleanupImages {
+                    cleanupCommandScreenshotURLs(imageURLs)
+                }
                 try? preserveOrDeleteRecording(informationURL)
                 stateQueue.async {
                     self.transcribing = false
@@ -820,11 +884,10 @@ final class PushToTalkController: @unchecked Sendable {
         log("transcribing information and command...")
 
         Task {
-            defer {
-                try? removeScreenContext(imageURL)
-            }
+            async let capturedImageURLs = resolveCommandScreenshotTasks(screenshotTasks)
             let information = await transcribeSegment(url: informationURL, label: "information")
             let command = await transcribeSegment(url: commandURL, label: "command")
+            let imageURLs = await capturedImageURLs
 
             log("\n[information] \(information.isEmpty ? "[no speech detected]" : information)\n")
             log("\n[command] \(command.isEmpty ? "[no speech detected]" : command)\n")
@@ -834,22 +897,57 @@ final class PushToTalkController: @unchecked Sendable {
                     let result = try await commandGenerator.generate(
                         information: information,
                         command: command,
-                        imageURLs: imageURL.map { [$0] } ?? []
+                        imageURLs: RecordingRoutePolicy.providerImages(action: action, images: imageURLs)
                     )
                     if !result.isEmpty {
-                        try await deliverResult(result, action: action, timing: timing)
+                        let outcome = try await deliverResult(
+                            result,
+                            action: action,
+                            timing: timing,
+                            imageURLs: RecordingRoutePolicy.deliveryImages(action: action, images: imageURLs)
+                        )
+                        guard outcome == .delivered else {
+                            throw CliError.invalidValue("command delivery was skipped: \(outcome)")
+                        }
+                        clearFailedCommandTurnAfterSuccess()
                     }
+                    cleanupCommandScreenshotURLs(imageURLs)
                 } catch {
                     fputs("command result failed: \(error)\n", stderr)
+                    let retained = retainFailedInteraction(
+                        provider: options.config.commandProvider.displayName,
+                        model: options.config.commandProvider.model,
+                        information: information,
+                        command: command,
+                        error: error,
+                        imageURLs: imageURLs
+                    )
+                    if retained {
+                        cleanupCommandScreenshotURLs(imageURLs)
+                    }
                 }
             } else if !information.isEmpty {
                 fputs(
                     "command segment was empty or invalid; using information transcript\n",
                     stderr
                 )
-                await deliverInformationFallback(information, action: action, timing: timing)
+                if action == .dump {
+                    let canCleanupImages = await deliverInformationFallback(
+                        information,
+                        action: action,
+                        timing: timing,
+                        imageURLs: imageURLs
+                    )
+                    if canCleanupImages {
+                        cleanupCommandScreenshotURLs(imageURLs)
+                    }
+                } else {
+                    _ = await deliverInformationFallback(information, action: action, timing: timing)
+                    cleanupCommandScreenshotURLs(imageURLs)
+                }
             } else {
                 fputs("command result skipped: command and information segments were empty or invalid\n", stderr)
+                cleanupCommandScreenshotURLs(imageURLs)
             }
 
             try? preserveOrDeleteRecording(informationURL)
@@ -863,26 +961,12 @@ final class PushToTalkController: @unchecked Sendable {
     }
 
     private func captureCommandImageContext() -> URL? {
-        guard options.config.localLLM.imageContextEnabled else {
-            return nil
-        }
-        return captureScreenContext(label: "command LLM image context", filePrefix: "command-context")
-    }
-
-    private func captureHermesScreenContext() -> URL? {
-        captureScreenContext(label: "Hermes screenshot", filePrefix: "hermes-screen")
+        captureScreenContext(label: "command screenshot", filePrefix: "command-context")
     }
 
     private func captureScreenContext(label: String, filePrefix: String) -> URL? {
-        let permissionGranted: Bool
-        if CGPreflightScreenCaptureAccess() {
-            permissionGranted = true
-        } else {
-            log("\(label): requesting Screen Recording permission")
-            permissionGranted = CGRequestScreenCaptureAccess()
-        }
-        guard permissionGranted else {
-            fputs("\(label) unavailable: Screen Recording permission denied. Grant this app access in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch.\n", stderr)
+        guard CGPreflightScreenCaptureAccess() else {
+            fputs("\(label) unavailable: Screen Recording permission is not granted. Use setup or System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch. Continuing with text only.\n", stderr)
             return nil
         }
 
@@ -896,10 +980,12 @@ final class PushToTalkController: @unchecked Sendable {
             return nil
         }
 
-        let dir = URL(fileURLWithPath: "~/Library/Application Support/fluid-push-to-talk/screenshots".expandingTilde, isDirectory: true)
+        let dir = Self.screenshotDirectoryURL
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let url = dir.appendingPathComponent("\(filePrefix)-\(Self.screenshotTimestamp()).png")
+            let url = dir.appendingPathComponent(
+                "\(filePrefix)-\(Self.screenshotTimestamp())-\(UUID().uuidString).png"
+            )
             try writePNG(image: image, to: url)
             log("\(label) captured: \(url.path)")
             return url
@@ -932,28 +1018,102 @@ final class PushToTalkController: @unchecked Sendable {
 
     private func removeScreenContext(_ url: URL?) throws {
         guard let url else { return }
-        try? FileManager.default.removeItem(at: url)
+        try FileManager.default.removeItem(at: url)
     }
 
-    private func removeHermesScreenshot(_ url: URL?) throws {
-        try removeScreenContext(url)
+    private func cleanupScreenContext(_ url: URL?, label: String) {
+        do {
+            try removeScreenContext(url)
+        } catch {
+            fputs("\(label) cleanup failed: \(error)\n", stderr)
+        }
     }
 
-    private func stopAndRunHermesAgent(informationURL: URL, screenshotURL: URL?) {
+    private func resolveCommandScreenshotTasks(
+        _ screenshotTasks: [Task<URL?, Never>]
+    ) async -> [URL] {
+        var urls: [URL] = []
+        for task in screenshotTasks {
+            if let url = await task.value {
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
+    private func cleanupCommandScreenshotTasks(
+        _ screenshotTasks: [Task<URL?, Never>]
+    ) async {
+        cleanupCommandScreenshotURLs(await resolveCommandScreenshotTasks(screenshotTasks))
+    }
+
+    private func cleanupCommandScreenshotURLs(_ urls: [URL]) {
+        for url in urls {
+            cleanupScreenContext(url, label: "command screenshot")
+        }
+    }
+
+    private func retainFailedInteraction(
+        provider: String,
+        model: String,
+        information: String,
+        command: String,
+        error: Error,
+        imageURLs: [URL]
+    ) -> Bool {
+        do {
+            try failedCommandTurnStore.retain(
+                provider: provider,
+                model: model,
+                information: information,
+                command: command,
+                errorDescription: String(describing: error),
+                imageURLs: imageURLs
+            )
+            log(
+                "failed command turn retained: \(failedCommandTurnStore.rootURL.path) "
+                    + "(\(imageURLs.count) image(s))"
+            )
+            return true
+        } catch {
+            fputs(
+                "failed command turn could not be retained: \(error). Original images remain at: "
+                    + "\(imageURLs.map(\.path).joined(separator: ", "))\n",
+                stderr
+            )
+            return false
+        }
+    }
+
+    private func clearFailedCommandTurnAfterSuccess() {
+        do {
+            try failedCommandTurnStore.clear()
+        } catch {
+            fputs("failed command turn cleanup failed: \(error)\n", stderr)
+        }
+    }
+
+    private func cleanupStaleScreenContexts() {
+        let fileManager = FileManager.default
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: Self.screenshotDirectoryURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        for url in urls where url.lastPathComponent.hasPrefix("command-context-")
+            || url.lastPathComponent.hasPrefix("hermes-screen-") {
+            cleanupScreenContext(url, label: "stale screenshot")
+        }
+    }
+
+    private func stopAndRunHermesAgent(screenshotTasks: [Task<URL?, Never>]) {
         guard let instructionURL = recorder.stop() else {
             endAudioDuckingIfNeeded()
-            transcribing = true
-            log("no Hermes instruction recording found; transcribing information fallback...")
             Task {
-                let information = await transcribeSegment(url: informationURL, label: "information")
-                await deliverInformationFallback(information, action: .paste, timing: deliveryTimingSnapshot())
-                try? preserveOrDeleteRecording(informationURL)
-                try? removeHermesScreenshot(screenshotURL)
-                stateQueue.async {
-                    self.transcribing = false
-                    self.resetDeliveryTiming()
-                }
+                await cleanupCommandScreenshotTasks(screenshotTasks)
             }
+            resetDeliveryTiming()
             return
         }
         endAudioDuckingIfNeeded()
@@ -962,33 +1122,27 @@ final class PushToTalkController: @unchecked Sendable {
         let targetBundleIdentifier = deliveryTargetBundleIdentifierSnapshot()
 
         transcribing = true
-        log("transcribing information and Hermes instruction...")
+        log("transcribing Hermes instruction...")
 
         Task {
-            let information = await transcribeSegment(url: informationURL, label: "information")
+            async let capturedImageURLs = resolveCommandScreenshotTasks(screenshotTasks)
             let instruction = await transcribeSegment(url: instructionURL, label: "Hermes instruction")
+            let imageURLs = await capturedImageURLs
 
-            log("\n[information] \(information.isEmpty ? "[no speech detected]" : information)\n")
             log("\n[hermes instruction] \(instruction.isEmpty ? "[no speech detected]" : instruction)\n")
 
             if !instruction.isEmpty {
                 enqueueHermesAgentJob(
-                    information: information,
                     instruction: instruction,
                     timing: timing,
                     targetBundleIdentifier: targetBundleIdentifier,
-                    screenshotURL: screenshotURL
+                    imageURLs: imageURLs
                 )
-            } else if !information.isEmpty {
-                fputs("Hermes instruction was empty; using information transcript\n", stderr)
-                await deliverInformationFallback(information, action: .paste, timing: timing)
-                try? removeHermesScreenshot(screenshotURL)
             } else {
-                fputs("Hermes agent skipped: information and instruction were empty or invalid\n", stderr)
-                try? removeHermesScreenshot(screenshotURL)
+                fputs("Hermes agent skipped: no speech was detected\n", stderr)
+                cleanupCommandScreenshotURLs(imageURLs)
             }
 
-            try? preserveOrDeleteRecording(informationURL)
             try? preserveOrDeleteRecording(instructionURL)
 
             stateQueue.async {
@@ -999,11 +1153,10 @@ final class PushToTalkController: @unchecked Sendable {
     }
 
     private func enqueueHermesAgentJob(
-        information: String,
         instruction: String,
         timing: DeliveryTiming?,
         targetBundleIdentifier: String?,
-        screenshotURL: URL?
+        imageURLs: [URL]
     ) {
         hermesJobIDLock.lock()
         let jobID = nextHermesJobID
@@ -1019,11 +1172,10 @@ final class PushToTalkController: @unchecked Sendable {
             Task {
                 await self.runHermesQueuedJob(
                     id: jobID,
-                    information: information,
                     instruction: instruction,
                     timing: timing,
                     targetBundleIdentifier: targetBundleIdentifier,
-                    screenshotURL: screenshotURL
+                    imageURLs: imageURLs
                 )
                 semaphore.signal()
             }
@@ -1033,49 +1185,86 @@ final class PushToTalkController: @unchecked Sendable {
 
     private func runHermesQueuedJob(
         id: Int,
-        information: String,
         instruction: String,
         timing: DeliveryTiming?,
         targetBundleIdentifier: String?,
-        screenshotURL: URL?
+        imageURLs: [URL]
     ) async {
-        defer {
-            try? removeHermesScreenshot(screenshotURL)
-        }
         log("Hermes job #\(id) running...")
         do {
             let hermesResult = try await hermesRunner.run(
-                information: information,
+                information: "",
                 instruction: instruction,
-                screenshotURL: screenshotURL
+                imageURLs: imageURLs
             )
             let result = hermesResult.output
             if !result.isEmpty {
                 log("\n[hermes result #\(id)] \(result)\n")
                 let targetAvailable = await activateOriginalTargetIfPossible(bundleIdentifier: targetBundleIdentifier)
                 if targetAvailable {
-                    try await deliverResult(result, action: .paste, timing: timing, logAsResult: false)
+                    let outcome = try await deliverResult(result, action: .paste, timing: timing, logAsResult: false)
+                    guard outcome == .delivered else {
+                        throw CliError.invalidValue("Hermes result delivery was skipped: \(outcome)")
+                    }
                 } else {
                     await copyHermesResultToClipboard(result)
                     fputs("Hermes result copied to clipboard because the original paste target is unavailable\n", stderr)
                 }
+                clearFailedCommandTurnAfterSuccess()
+                cleanupCommandScreenshotURLs(imageURLs)
                 log("Hermes job #\(id) completed from visible foreground session \(hermesResult.sessionID ?? "unknown")")
             } else {
-                fputs("Hermes job #\(id) returned an empty result; see \(hermesResult.logURL.path)\n", stderr)
+                throw CliError.invalidValue("Hermes returned an empty result; see \(hermesResult.logURL.path)")
             }
         } catch {
             fputs("Hermes job #\(id) failed: \(error)\n", stderr)
+            let retained = retainFailedInteraction(
+                provider: "Hermes",
+                model: options.config.hermesAgent.sessionName,
+                information: "",
+                command: instruction,
+                error: error,
+                imageURLs: imageURLs
+            )
+            if retained {
+                cleanupCommandScreenshotURLs(imageURLs)
+            }
         }
     }
 
-    private func deliverInformationFallback(_ information: String, action: HotkeyAction, timing: DeliveryTiming?) async {
+    private func deliverInformationFallback(
+        _ information: String,
+        action: HotkeyAction,
+        timing: DeliveryTiming?,
+        imageURLs: [URL] = []
+    ) async -> Bool {
         guard !information.isEmpty else {
-            return
+            return true
         }
         do {
-            try await deliverResult(information, action: action, timing: timing)
+            let outcome = try await deliverResult(
+                information,
+                action: action,
+                timing: timing,
+                imageURLs: imageURLs
+            )
+            guard outcome == .delivered else {
+                throw CliError.invalidValue("fallback delivery was skipped: \(outcome)")
+            }
+            return true
         } catch {
             fputs("fallback delivery failed: \(error)\n", stderr)
+            guard action == .dump else {
+                return true
+            }
+            return retainFailedInteraction(
+                provider: "Markdown",
+                model: "local-dump",
+                information: information,
+                command: "",
+                error: error,
+                imageURLs: imageURLs
+            )
         }
     }
 
@@ -1083,28 +1272,38 @@ final class PushToTalkController: @unchecked Sendable {
         _ result: String,
         action: HotkeyAction,
         timing: DeliveryTiming?,
-        logAsResult: Bool = true
-    ) async throws {
+        logAsResult: Bool = true,
+        imageURLs: [URL] = []
+    ) async throws -> DeliveryOutcome {
         if logAsResult {
             log("\n[result] \(result)\n")
         }
-        let outputMethod = options.config.llmOutput.method(for: action)
+        let outputMethod: LLMOutputMethod = action == .dump
+            && options.config.controlOptionMode == .dump
+            ? .dump
+            : options.config.llmOutput.method(for: action)
+        if case let .skipped(reason) = DeliveryPolicy.permission(
+            for: outputMethod,
+            pasteEnabled: options.config.paste.enabled,
+            dumpEnabled: options.config.dump.enabled
+        ) {
+            return .skipped(reason: reason)
+        }
         switch outputMethod {
         case .clipboard:
-            guard options.config.paste.enabled else {
-                return
-            }
             await MainActor.run {
                 self.typer.paste(result)
                 self.logDeliveryTiming(timing, delivery: "pasted")
             }
+            return .delivered
         case .dump:
-            guard options.config.dump.enabled else {
-                return
-            }
-            let destination = try dumper.dumpRaw(result)
-            log("dumped markdown to \(destination.path)")
+            let dumpResult = try dumper.dumpRaw(result, imageURLs: imageURLs)
+            log(
+                "dumped markdown to \(dumpResult.noteURL.path) "
+                    + "(\(dumpResult.attachmentURLs.count) image(s))"
+            )
             self.logDeliveryTiming(timing, delivery: "dumped")
+            return .delivered
         case .bluetoothKeyboard:
             let delivery = try await bluetoothKeyboard.send(result)
             log("typed \(delivery.byteCount) UTF-8 bytes through ESP32 on \(delivery.port)")
@@ -1112,6 +1311,7 @@ final class PushToTalkController: @unchecked Sendable {
                 log("ESP32 completion: \(delivery.completion)")
             }
             self.logDeliveryTiming(timing, delivery: "bluetooth-keyboard")
+            return .delivered
         }
     }
 
@@ -1418,28 +1618,55 @@ final class TerminalCommandReader: @unchecked Sendable {
     }
 }
 
+struct PictureKeyLatch {
+    private(set) var isDown = false
+    private(set) var ownsCurrentPress = false
+
+    mutating func keyDown(isAutorepeat: Bool, acquire: () -> Bool) -> Bool {
+        if isDown {
+            return ownsCurrentPress
+        }
+        isDown = true
+        guard !isAutorepeat else {
+            ownsCurrentPress = false
+            return false
+        }
+        ownsCurrentPress = acquire()
+        return ownsCurrentPress
+    }
+
+    mutating func keyUp() -> Bool {
+        let wasOwned = ownsCurrentPress
+        isDown = false
+        ownsCurrentPress = false
+        return wasOwned
+    }
+}
+
 final class HotkeyMonitor: @unchecked Sendable {
+    private let commandScreenshotKeyCode: CGKeyCode = 35
     private let controller: PushToTalkController
+    private let pasteHotkey: HotkeyConfig
+    private let dumpHotkey: HotkeyConfig
     private let bluetoothKeysByCode: [CGKeyCode: HotkeyKey]
-    private let hasRegularBluetoothKey: Bool
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var bluetoothHotkeyActive = false
+    private var commandScreenshotKeyLatch = PictureKeyLatch()
 
     init(controller: PushToTalkController, hotkeys: HotkeysConfig) {
         self.controller = controller
+        pasteHotkey = hotkeys.paste
+        dumpHotkey = hotkeys.dump
         bluetoothKeysByCode = hotkeys.bluetooth.isEnabled ? hotkeys.bluetooth.keysByCode : [:]
-        hasRegularBluetoothKey = hotkeys.bluetooth.isEnabled && hotkeys.bluetooth.hasRegularKey
     }
 
     func start() throws {
         PermissionHelper.requestAccessibilityPrompt()
 
         var mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
-        if hasRegularBluetoothKey {
-            mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
-            mask |= CGEventMask(1 << CGEventType.keyUp.rawValue)
-        }
+        mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
+        mask |= CGEventMask(1 << CGEventType.keyUp.rawValue)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -1490,7 +1717,7 @@ enum PermissionHelper {
         openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
     }
 
-    static func printTerminalScreenRecordingFirstRunHintIfNeeded() {
+    static func printScreenRecordingFirstRunHintIfNeeded() {
         guard !CGPreflightScreenCaptureAccess() else {
             return
         }
@@ -1504,15 +1731,15 @@ enum PermissionHelper {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let message = """
 
-        IMPORTANT: Hermes Agent screenshot context needs macOS Screen Recording permission.
+        IMPORTANT: Optional P screenshots need macOS Screen Recording permission.
 
-        Because this dev build is launched from Terminal, grant Screen & System Audio Recording access to Terminal before using Hermes Agent screenshots:
+        Because this dev build is launched from Terminal, grant Screen & System Audio Recording access to Terminal before capturing screenshots with P:
 
         1. Open System Settings → Privacy & Security → Screen & System Audio Recording
         2. Enable Terminal
         3. Fully quit and reopen Terminal, then restart fluid-push-to-talk
 
-        I will open the relevant Privacy Settings pane now. Without this permission Hermes still works, but it will not receive screenshots.
+        I will open the relevant Privacy Settings pane now. Without this permission all recording modes still work with text only.
         """
         fputs("\(message)\n", stderr)
         openScreenRecordingSettings()
@@ -1550,6 +1777,22 @@ enum PermissionHelper {
 private extension HotkeyMonitor {
     func handleEvent(type: CGEventType, event: CGEvent) -> Bool {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        if keyCode == commandScreenshotKeyCode {
+            switch type {
+            case .keyDown:
+                let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+                let screenshotChordIsPressed = pasteHotkey.isPressed(in: event.flags)
+                    || dumpHotkey.isPressed(in: event.flags)
+                return commandScreenshotKeyLatch.keyDown(isAutorepeat: isAutorepeat) {
+                    screenshotChordIsPressed && controller.captureCommandScreenshot()
+                }
+            case .keyUp:
+                return commandScreenshotKeyLatch.keyUp()
+            default:
+                break
+            }
+        }
+
         if let bluetoothKey = bluetoothKeysByCode[keyCode] {
             switch type {
             case .flagsChanged where bluetoothKey.isModifier:
@@ -1703,6 +1946,14 @@ struct FluidPushToTalk {
             return
         }
 
+        if options.testHermesInstruction != nil {
+            Task {
+                await runHermesInstructionTest(options: options)
+            }
+            RunLoop.current.run()
+            return
+        }
+
         if let text = options.testBluetoothKeyboardText {
             Task {
                 await runBluetoothKeyboardTest(text: text, options: options)
@@ -1735,13 +1986,12 @@ struct FluidPushToTalk {
         }
 
         do {
-            let llmClient = CommandLLMClientFactory.make(config: options.config.localLLM)
-            let generator = CommandResultGenerator(config: options.config, llmClient: llmClient)
-            let imageURLs = options.testCommandImage.map { [$0] } ?? []
+            let llmClient = makeCommandLLMClient(options: options)
+            let generator = CommandResultGenerator(prompts: options.config.prompts, llmClient: llmClient)
             let result = try await generator.generate(
                 information: information,
                 command: command,
-                imageURLs: imageURLs
+                imageURLs: options.testCommandImages
             )
             print("[result] \(result)")
             exit(0)
@@ -1751,9 +2001,39 @@ struct FluidPushToTalk {
         }
     }
 
+    private static func runHermesInstructionTest(options: Options) async {
+        guard let instruction = options.testHermesInstruction,
+              !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            fputs("--test-hermes-instruction requires non-empty text\n", stderr)
+            exit(1)
+        }
+        do {
+            let result = try await HermesAgentRunner(config: options.config.hermesAgent).run(
+                information: "",
+                instruction: instruction,
+                imageURLs: options.testHermesImages
+            )
+            print("[hermes result] \(result.output)")
+            exit(0)
+        } catch {
+            fputs("Hermes instruction test failed: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
+    private static func makeCommandLLMClient(options: Options) -> any CommandLLMClient {
+        let config = options.config
+        let apiKey = config.commandProvider.resolveAPIKey(configURL: options.activeConfigURL)
+        switch config.commandProvider {
+        case .openAI:
+            return OpenAIResponsesClient(apiKey: apiKey)
+        case .cerebras:
+            return CerebrasChatCompletionsClient(apiKey: apiKey)
+        }
+    }
+
     private static func logOutputConfiguration(options: Options) {
         let pasteOutput = options.config.llmOutput.paste
-        let dumpOutput = options.config.llmOutput.dump
         let bluetoothOutput = options.config.llmOutput.bluetooth
         let bluetoothPort = options.config.bluetoothKeyboard.resolvedPort ?? "automatisch"
         let bluetoothLine: String
@@ -1763,12 +2043,20 @@ struct FluidPushToTalk {
             bluetoothLine = "  \(options.config.hotkeys.bluetooth.displayName): \(bluetoothOutput.locationDisplayName) -> \(bluetoothOutput.destinationDisplayName)\(bluetoothOutput == .bluetoothKeyboard ? " (Port: \(bluetoothPort))" : "")"
         }
         let audioInput = (try? AudioInputDevices.resolve(config: options.config.audioInput).summary) ?? "nicht verfuegbar"
+        let controlOptionLine: String
+        switch options.config.controlOptionMode {
+        case .dump:
+            controlOptionLine = "\(options.config.hotkeys.dump.displayName): LOKAL -> Markdown-Dump, optional P screenshots"
+        case .hermes:
+            controlOptionLine = "\(options.config.hotkeys.dump.displayName): Hermes Agent, optional P screenshots"
+        }
         log(
             """
             Output-Konfiguration: \(options.activeConfigURL.path)
               Audio Input: \(audioInput)
+              Command LLM: \(options.config.commandProvider.displayName) \(options.config.commandProvider.model), optional P screenshots
               \(options.config.hotkeys.paste.displayName): \(pasteOutput.locationDisplayName) -> \(pasteOutput.destinationDisplayName)\(pasteOutput == .bluetoothKeyboard ? " (Port: \(bluetoothPort))" : "")
-              \(options.config.hotkeys.dump.displayName): \(dumpOutput.locationDisplayName) -> \(dumpOutput.destinationDisplayName)\(dumpOutput == .bluetoothKeyboard ? " (Port: \(bluetoothPort))" : "")
+              \(controlOptionLine)
             \(bluetoothLine)
             """
         )
@@ -1793,8 +2081,7 @@ struct FluidPushToTalk {
                 language: options.config.asr.language
             )
             log("FluidAudio ASR ready: model \(options.config.asr.modelVersion), language \(asrLanguage.displayValue)")
-            let llmClient = CommandLLMClientFactory.make(config: options.config.localLLM)
-            let readinessMonitor = LocalLLMReadinessMonitor(config: options.config, llmClient: llmClient)
+            let llmClient = makeCommandLLMClient(options: options)
             let recorder = AudioRecorder(audioInput: options.config.audioInput)
 
             let controller = PushToTalkController(
@@ -1808,8 +2095,7 @@ struct FluidPushToTalk {
                 ),
                 dumper: MarkdownDumper(config: options.config),
                 bluetoothKeyboard: BluetoothKeyboardOutput(config: options.config.bluetoothKeyboard),
-                commandGenerator: CommandResultGenerator(config: options.config, llmClient: llmClient),
-                llmReadinessMonitor: readinessMonitor
+                commandGenerator: CommandResultGenerator(prompts: options.config.prompts, llmClient: llmClient)
             )
             let monitor = HotkeyMonitor(controller: controller, hotkeys: options.config.hotkeys)
             let terminalCommandReader = TerminalCommandReader(controller: controller)
@@ -1817,24 +2103,20 @@ struct FluidPushToTalk {
             try await MainActor.run {
                 log("starting hotkey monitor...")
                 try monitor.start()
-                if options.config.hermesAgent.enabled {
-                    PermissionHelper.printTerminalScreenRecordingFirstRunHintIfNeeded()
-                }
+                PermissionHelper.printScreenRecordingFirstRunHintIfNeeded()
                 RuntimeState.shared.monitor = monitor
                 RuntimeState.shared.terminalCommandReader = terminalCommandReader
-                RuntimeState.shared.llmReadinessMonitor = readinessMonitor
                 let bluetoothHint = !options.config.hotkeys.bluetooth.isEnabled
                     ? ""
                     : " Hold \(options.config.hotkeys.bluetooth.displayName) for Bluetooth."
-                let hermesHint = options.config.hermesAgent.enabled
-                    ? " release Command first while holding Option for Hermes Agent mode;"
-                    : ""
+                let controlOptionHint = options.config.controlOptionMode == .hermes
+                    ? " Hold \(options.config.hotkeys.dump.displayName) for one-segment Hermes Agent mode with optional P screenshots."
+                    : " Hold \(options.config.hotkeys.dump.displayName) to write Markdown with optional P screenshots."
                 log(
-                    "Hold \(options.config.hotkeys.paste.displayName) for local paste. Release Option first while holding Command for local command mode;\(hermesHint)\(bluetoothHint) Hold \(options.config.hotkeys.dump.displayName) to dump. Press Ctrl+C to quit."
+                    "Hold \(options.config.hotkeys.paste.displayName) for local paste; press P up to five times during the first recording for screenshots. Release Option first while holding Command for provider command mode.\(controlOptionHint)\(bluetoothHint) Press Ctrl+C to quit."
                 )
             }
             terminalCommandReader.start()
-            readinessMonitor.warmUpInBackground(reason: "startup")
         } catch {
             fputs("\(error)\n", stderr)
             exit(1)
@@ -1847,7 +2129,6 @@ final class RuntimeState: @unchecked Sendable {
     var instanceLock: SingleInstanceLock?
     var monitor: HotkeyMonitor?
     var terminalCommandReader: TerminalCommandReader?
-    var llmReadinessMonitor: LocalLLMReadinessMonitor?
 
     private init() {}
 }
@@ -1865,8 +2146,6 @@ enum ConsoleColor {
     private static let blue = "\u{001B}[34m"
     private static let magenta = "\u{001B}[35m"
     private static let cyan = "\u{001B}[36m"
-    private static let dim = "\u{001B}[2m"
-
     static func colorized(_ message: String) -> String {
         guard shouldColor else {
             return message
@@ -1889,12 +2168,8 @@ enum ConsoleColor {
             color = green
         } else if lowercased.contains("recording") {
             color = magenta
-        } else if lowercased.contains("transcribing")
-            || lowercased.contains("local mlx") {
+        } else if lowercased.contains("transcribing") {
             color = cyan
-        } else if lowercased.contains("skill selection")
-            || lowercased.contains("using skill") {
-            color = dim
         } else {
             color = blue
         }

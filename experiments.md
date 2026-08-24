@@ -1,26 +1,52 @@
-# LLM Speed Experiments
+# Multi-Image Provider Benchmarks
 
-Date: 2026-05-22
+Stand: 2026-08-24
 
-| Experiment | Result | Decision |
-|---|---:|---|
-| Bonsai default MLX eval | ~8-10 tok/s | Too slow |
-| `--cache-size 4096 --memory-size 4096` | 34-36 tok/s best runs | Kept |
-| KV cache quantization (`--kv-bits 4/8`) | No improvement | Rejected |
-| Reset `llm-tool chat` before each command | Spanish test ~2.03s; prevents history growth | Kept |
-| Compact system prompt | TTFT avg 0.89s -> 0.48s in persistent chat | Kept |
-| Debug-only prompt logging | Removes hot-path terminal output | Kept |
-| Prompt labels `Task`/`Information` vs `Do`/`Text` | TTFT 0.492s -> 0.467s; TPS 27.06 -> 28.38 | Kept `Do`/`Text` |
-| Extra memory/cache sweep | No reliable improvement over 4096/4096 | Rejected |
-| Reset before request vs reset after response vs no reset | Visible wall ~0.73s in all cases | Rejected; no meaningful win |
-| MLX Python one-shot CLI | Spanish 33.9 tok/s; long 28.9 tok/s | Rejected; not >20% vs Swift |
-| MLX Python persistent raw worker | TTFT 0.41s but wrong Spanish output | Rejected; quality broken |
-| MLX Python persistent chat-template worker | Spanish TTFT 3.85s, 5.83 tok/s; long 6.51 tok/s | Rejected; much slower |
-| MLX Python KV/cache/activation options | KV slower; max-kv slower; activation quantization unsupported | Rejected |
-| MLX Python prompt cache | Failed with current CLI cache-file handling | Rejected |
+## Gemessene Ergebnisse
 
-Latest full-suite speed check: 29.14 tok/s. Latest exact Spanish command: 1.63s.
+| Bilder | OpenAI `gpt-5.6-luna` | Cerebras `gemma-4-31b` |
+| ---: | ---: | ---: |
+| 2 | 7.49 s | 4.77 s |
+| 5 | 17.94 s | 9.03 s |
 
-Current guardrail: `tests/local_llm_speed_case.py` requires at least 20 tok/s.
+Diese Werte sind beobachtete End-to-End-Latenzen der Multi-Image-Checks, keine garantierten Servicezeiten. Sie belegen, dass beide Clients mehrere geordnete Bilder verarbeiten; sie entscheiden nicht automatisch, welcher Provider fuer einen User ausgewaehlt wird.
 
-Conclusion: under Bonsai-only and current MLX Swift/Python runtimes, no tested architecture produced a reliable >20% improvement over the current warmed Swift `llm-tool chat` path. Big next steps require either a different inference runtime, native in-process MLX Swift integration, speculative decoding with a compatible draft model, or a smaller/faster model.
+## Feste Request-Profile
+
+- OpenAI: Responses API, `gpt-5.6-luna`, Reasoning `low`, Text-Verbosity `low`, `detail: low`, `store: false`.
+- Cerebras: Chat Completions, `gemma-4-31b`.
+- Null bis fuenf Bilder pro Command, in Capture-Reihenfolge.
+- Keine automatische Bildaufnahme; nur physische `P`-Taps im ersten `Command + Option`-Segment zaehlen.
+- Kein Cross-Provider-Fallback und kein Output nach Provider-Fehler.
+
+## Interpretation
+
+Cerebras war in diesen Messungen schneller:
+
+- Zwei Bilder: 2.72 s schneller als OpenAI.
+- Fuenf Bilder: 8.91 s schneller als OpenAI.
+
+Die Latenz steigt bei beiden Providern mit der Bildanzahl deutlich. Deshalb bleiben Bilder optional und auf fuenf begrenzt. Der Repository-Default bleibt OpenAI; die lokale User-Config dieses Macs nutzt Cerebras.
+
+## Guardrails fuer weitere Messungen
+
+- Gleiches Prompt-, Bild-, Netzwerk- und Output-Ziel fuer beide Provider verwenden.
+- Mindestens zehn Durchlaeufe je Fall erfassen und Median sowie p95 berichten.
+- Null-, Zwei- und Fuenf-Bild-Faelle getrennt messen.
+- Provider-Fehler separat ausweisen; sie duerfen keinen zweiten Provider-Request ausloesen.
+- Keine API-Keys, Prompts, Transkripte oder Screenshot-Inhalte in Logs oder Ergebnisdateien speichern.
+- Temporaere Bilder nach jedem Erfolg und Fehler pruefbar entfernen.
+
+## Diagnosefelder fuer Benchmarks
+
+Die strukturierten Provider-Logs liefern ohne Request-Body-Inhalte:
+
+- logische Request-ID, Provider/Modell und Prompt-Zeichenanzahlen;
+- Bildpfad, Bytes, MIME, Base64-Laenge und SHA-256 pro Bild;
+- Payload-Bytes, Build-Dauer und konfigurierten Timeout;
+- Versuch `n/max`, Dauer, HTTP-Status, Response-Bytes und Provider-Request-ID;
+- Retry-Grund sowie terminale `NSError`-Domain und Code.
+
+Damit lassen sich Build-, Netzwerk-, Retry- und Response-Zeit getrennt vergleichen. Besonders bei Timeout-Messungen muessen erster Versuch, `retry_reason=timeout`, zweiter Versuch und terminales Ergebnis dieselbe logische Request-ID tragen.
+
+API-Key, `Authorization` und rohe Base64-Daten duerfen niemals in Benchmark-Artefakte gelangen. Das lokale `last-failed-command`-Bundle ist ebenfalls kein Benchmark-Artefakt: Es enthaelt sensible Transkripte und Bildkopien, liegt mit `0700`/`0600` unter `~/Library/Application Support/fluid-push-to-talk/last-failed-command/`, wird durch einen neueren Fehler ersetzt und erst nach erfolgreicher Provider-Antwort plus erfolgreicher Delivery geloescht. Normales Diktat und leere Commands duerfen es nicht veraendern.

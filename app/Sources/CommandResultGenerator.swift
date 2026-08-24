@@ -1,79 +1,40 @@
 import Foundation
 
 final class CommandResultGenerator: @unchecked Sendable {
-    private let config: AppConfig
-    private let skillCallingService: SkillCallingService
-    private let llmClient: CommandLLMClient
+    private let prompts: PromptConfig
+    private let llmClient: any CommandLLMClient
 
-    init(
-        config: AppConfig,
-        llmClient: CommandLLMClient,
-        skillCallingService: SkillCallingService? = nil
-    ) {
-        self.config = config
+    init(prompts: PromptConfig, llmClient: any CommandLLMClient) {
+        self.prompts = prompts
         self.llmClient = llmClient
-        self.skillCallingService = skillCallingService ?? SkillCallingService(config: config)
     }
 
     func generate(information: String, command: String, imageURLs: [URL] = []) async throws -> String {
         let request = normalizedRequest(information: information, command: command)
-        let activeImageURLs = config.localLLM.imageContextEnabled ? imageURLs : []
-        guard config.localLLM.canGenerateCommands else {
-            let skillContext = skillCallingService.buildContext(
-                information: request.information,
-                command: request.command
-            )
-            log("command LLM disabled; using fallback result")
-            return skillContext.toolFallback ?? request.fallback
-        }
 
-        let skillContext = await skillCallingService.buildContext(
+        let startedAt = Date()
+        log("sending command request to \(llmClient.displayName)...")
+        let prompt = commandPrompt(
             information: request.information,
-            command: request.command,
-            llmClient: llmClient,
-            systemPrompt: config.prompts.coreCommand.system
+            command: request.command
         )
-        if let finalResult = skillContext.finalResult {
-            return finalResult
+        if !imageURLs.isEmpty {
+            log("command image context attached (\(imageURLs.count) image(s))")
         }
-
-        do {
-            let startedAt = Date()
-            log("sending command LLM request to \(llmClient.displayName)...")
-            let prompt = commandPrompt(
-                information: request.information,
-                command: request.command,
-                skillContext: skillContext.renderedContext
-            )
-            if !activeImageURLs.isEmpty {
-                log("command LLM image context attached (\(activeImageURLs.count) image(s))")
-            }
-            LLMDebugLogger.logPrompt(prompt, label: "core-command", config: config)
-            let content = try await llmClient.complete(
-                systemPrompt: config.prompts.coreCommand.system,
-                userPrompt: prompt,
-                imageURLs: activeImageURLs
-            )
-            guard !content.isEmpty else {
-                throw CliError.invalidValue("command LLM returned an empty response")
-            }
-            log(
-                "command LLM response received in \(formatSeconds(Date().timeIntervalSince(startedAt))) (\(content.count) chars)"
-            )
-            return content
-        } catch {
-            fputs(
-                "command LLM unavailable for command result; using fallback text: \(error)\n",
-                stderr
-            )
-            return skillContext.toolFallback ?? request.fallback
-        }
+        let content = try await llmClient.complete(
+            systemPrompt: prompts.coreCommand.system,
+            userPrompt: prompt,
+            imageURLs: imageURLs
+        )
+        log(
+            "command response received from \(llmClient.displayName) in \(formatSeconds(Date().timeIntervalSince(startedAt))) (\(content.count) chars)"
+        )
+        return content
     }
 
     private struct CommandRequest {
         let information: String
         let command: String
-        let fallback: String
     }
 
     private func normalizedRequest(information: String, command: String) -> CommandRequest {
@@ -82,14 +43,12 @@ final class CommandResultGenerator: @unchecked Sendable {
             let normalizedQuestion = canonicalStandaloneQuestion(command)
             return CommandRequest(
                 information: normalizedQuestion,
-                command: information,
-                fallback: command
+                command: information
             )
         }
         return CommandRequest(
             information: canonicalStandaloneQuestion(information),
-            command: command,
-            fallback: information
+            command: command
         )
     }
 
@@ -158,21 +117,9 @@ final class CommandResultGenerator: @unchecked Sendable {
         return "Erkläre kurz: \(subject)."
     }
 
-    private func commandPrompt(information: String, command: String, skillContext: String?) -> String {
-        let promptConfig = config.prompts.coreCommand
-        if let skillContext {
-            return renderPromptTemplate(
-                promptConfig.userTemplateWithSkillContext,
-                values: [
-                    "command": command,
-                    "information": information,
-                    "skill_context": skillContext,
-                ]
-            )
-        }
-
+    private func commandPrompt(information: String, command: String) -> String {
         return renderPromptTemplate(
-            promptConfig.userTemplate,
+            prompts.coreCommand.userTemplate,
             values: [
                 "command": command,
                 "information": information,

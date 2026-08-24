@@ -1,108 +1,77 @@
 # Features
 
-## Native Push-To-Talk Dictation
+## Local Dictation
 
-- Records audio on macOS while the configured hotkey chord is held.
-- Uses FluidAudio/CoreML ASR for local transcription.
-- Applies configured post-ASR spelling replacements from `config/textReplacements.json` before paste, dump, or command generation.
-- Defaults to the multilingual `v3` ASR model with German language hint.
-- Supports `--model-version v2|v3` and `--language CODE|auto` runtime overrides.
+- Records while the configured hotkey is held and transcribes with FluidAudio/CoreML.
+- Applies replacements from `config/textReplacements.json` before delivery or command generation.
+- Supports multilingual v3 and English v2 ASR plus explicit or automatic language selection.
+- `Command + Option` released together stays local and delivers through `llm_output.paste`.
 
-## Paste Mode
+## Two-Stage Command Mode
 
-- `Command + Option` records dictated speech while both keys are held.
-- Releasing both keys together transcribes the recording and uses the configured `llm_output.paste` method.
-- Clipboard paste behavior is configurable, including paste delay and clipboard restoration.
+- Releasing `Option` while holding `Command` finishes the information segment and starts the spoken instruction segment.
+- Releasing `Command` transcribes both segments and sends them to the selected command provider.
+- OpenAI uses the Responses API with `gpt-5.6-luna`, low reasoning, low text verbosity, `store: false`, and low-detail images.
+- Cerebras uses Chat Completions with `gemma-4-31b`.
+- The checked-in default is OpenAI; an installed user config may override it. This Mac's installed config selects Cerebras.
+- A provider error produces no command output. There is no cross-provider or transcript fallback after a request error.
+- An empty instruction skips the request and delivers the information transcript.
 
-## Bluetooth Keyboard Mode
+## Safe Request Diagnostics
 
-- Disabled by default until enabled in setup.
-- The setup wizard accepts a configured Bluetooth key such as `f18` or `right_shift`; pressing Enter uses the setup default.
-- Holding the configured Bluetooth key starts push-to-talk recording, and releasing it sends the transcript through the configured Bluetooth route.
-- `Command + Option` remains dedicated to local clipboard paste.
+- Both provider clients assign one logical request ID and emit structured request, image, attempt, retry, and terminal-failure records.
+- Request records include provider/model, prompt character counts, image count, payload bytes, build duration, and timeout.
+- Image records include ordered index, local path, byte count, MIME type, Base64 character count, and SHA-256.
+- Attempt records include attempt number/maximum, duration, outcome, HTTP status, response bytes, and provider request ID.
+- Retry records expose `timeout`, `http_429`, or `http_5xx`; terminal records include `NSError` domain and code.
+- Logs never contain an API key, `Authorization` header, or raw Base64 body.
 
-## Paste Command Mode
+## Failed Command Retention
 
-- `Command + Option`, then releasing `Option` while holding `Command`, records an information segment and immediately starts a command segment.
-- Releasing `Command` transcribes both segments.
-- The app sends the information, optional skill context, and command to the configured local LLM.
-- Command generation uses one generic prompt shape for every request: task first, then the information to work with.
-- If the command segment is empty, the app pastes the information transcript.
-- If the LLM is unavailable, the app falls back to relevant skill output or the information transcript.
+- Provider, Hermes, Markdown, and delivery failures replace `~/Library/Application Support/fluid-push-to-talk/last-failed-command/` with the newest failed turn through a staged, crash-recoverable promotion.
+- `turn.json` stores provider/model, information, command, error, timestamp, and retained-image metadata; copied images sit beside it.
+- Directory permissions are `0700`; manifest and image files are `0600`.
+- Only a later successful provider or Hermes response plus successful delivery clears the bundle.
+- Normal dictation and empty-command information fallback leave it untouched.
 
-## Markdown Dump Mode
+## Explicit Multi-Image Context
 
-- `Control + Option` records dictated speech while both keys are held.
-- Releasing both keys together transcribes the recording and uses the configured `llm_output.dump` method.
-- The dump target, date placeholder, append behavior, and timestamp inclusion are configurable.
+- While the first `Command + Option` or `Control + Option` recording is active, each physical `P` press captures one full-desktop screenshot.
+- Zero images is valid; no screenshot is captured automatically when command mode starts.
+- Capture order is preserved and at most five images are sent. A sixth press is ignored.
+- A key-down latch ignores keyboard auto-repeat. The physical `P` key-up resets the latch for the next capture.
+- Handled `P` key-down and key-up events are swallowed during capture mode.
+- Screenshot permission or capture failure omits that image without stopping audio recording.
+- Temporary images are deleted on success, failure, cancellation, normal dictation, and stale-file cleanup.
 
-## Continuous Markdown Dump Mode
+## Setup
 
-- After starting the app with `./restart.sh`, type `go` in the app Terminal to begin continuous recording.
-- Type `stop` in the app Terminal to stop recording, transcribe the full segment, and append it to the configured Obsidian daily note.
-- Press Tab in the app Terminal to autocomplete `go`, `stop`, `status`, `help`, and `quit`.
-- Continuous terminal recording does not transcribe or write partial data before `stop`.
+- Guided setup asks for language, paste shortcut, OpenAI or Cerebras, the selected provider's hidden key, and the `Control + Option` mode.
+- Writes `command_provider` to user config and preserves the other provider's key in the adjacent `.env` file.
+- Uses `OPENAI_API_KEY` for OpenAI and `CEREBRAS_API_KEY` for Cerebras.
+- Keeps API keys out of JSON and enforces `.env` mode `0600`.
 
-## Markdown Dump Command Mode
+## Selectable Control + Option Mode
 
-- `Control + Option`, then releasing `Control` while holding `Option`, records an information segment and immediately starts a command segment.
-- Releasing `Option` transcribes both segments.
-- The app sends the information, optional skill context, and command to the configured local LLM.
-- The generated result is appended to the configured Markdown daily note.
-- If the command segment is empty, the app appends the information transcript.
+- `control_option_mode: dump` writes one transcript plus zero to five screenshots to Markdown.
+- Permanent PNGs live under the note-relative `attachments/YYYY-MM-DD/` folder and appear as portable relative Markdown image links.
+- The two-stage Dump command sends text only to the selected provider, then archives its result plus the captured screenshots in Markdown.
+- `control_option_mode: hermes` sends one spoken instruction plus ordered native `/image` attachments to the visible Hermes session and returns the result to the original app or Clipboard.
+- The old Command-first Hermes continuation gesture is removed.
+- Terminal `go` and `stop` retain independent text-only continuous Markdown recording; `status`, `help`, and `quit` retain Tab completion.
 
-## Command LLM Integration
+## Optional Hermes Agent
 
-- Uses the OpenAI-compatible Chat Completions schema for command transformations by default.
-- Includes a first-class Cerebras provider preset for `gemma-4-31b` at `https://api.cerebras.ai/v1` using `CEREBRAS_API_KEY` from the local `.env` file.
-- `local_llm.image_context_enabled` attaches a PNG screenshot as an OpenAI-compatible `image_url` content part for command enhancement when enabled; the Cerebras preset enables it by default.
-- Supports generic `base_url`, `model`, and `OPENAI_API_KEY` configuration through the setup wizard.
-- Keeps Azure DeepSeek available as an explicit hosted-provider preset.
-- Keeps the MLX Swift Examples `llm-tool chat` client available as a configurable fallback provider.
-- Supports configurable provider, endpoint, API key environment variable, temperature, max tokens, timeout, model, and enable/disable flag.
-- `local_llm.command_generation_enabled` can disable LLM generation for two-step commands while preserving skill/tool fallback behavior.
-- Loads LLM system and user prompt templates from `promptConfig.json`.
-- Console output logs the exact prompt sent to the command LLM.
-- Console output reports the configured LLM, readiness status, selected skills, request start, and response latency.
-- Startup output begins with the app version.
+- Hermes retains its persistent named session, current Clipboard context, visible Terminal execution, response export, and serialized job queue.
+- OpenClaw is not offered because no independent OpenClaw runtime contract is installed.
 
-## Configurable Text Output
+## Optional Bluetooth Keyboard
 
-- Routes normal transcripts and two-step command results independently for local paste, dump, and Bluetooth hotkeys.
-- Supports `clipboard`, `dump`, and `bluetooth-keyboard` output methods.
-- Preserves the existing clipboard paste and Markdown dump defaults.
-- Implements the ESP32 `KBD1` serial protocol directly in Swift without launching an external process.
-- Auto-detects one `/dev/cu.usbmodem*` or `/dev/cu.usbserial*` device, with an explicit port override for multi-device systems.
-- Keeps the serial connection open and performs transfer work away from the LLM and main queues.
-- Provides `--test-bluetooth-keyboard TEXT` for a direct connection and typing check without ASR startup.
+- The configured Bluetooth hotkey records locally and routes through `llm_output.bluetooth`.
+- The Swift ESP32 `KBD1` implementation and `--test-bluetooth-keyboard TEXT` diagnostic remain unchanged.
 
-## Local Skills
+## Output and Recording
 
-- Fast generic skill selection scans `skills/*/SKILL.md` before each two-step command LLM request.
-- Selection uses standard skill frontmatter: `name` and `description`.
-- The command and information transcripts are scored against skill metadata.
-- The best matching skill instructions are injected as `Skill context`.
-- Command-result behavior is core software, not a selectable skill.
-- The app does not execute arbitrary commands from selected skills.
-- Registered runtime tools can attach tool output.
-- Existing selectable skills: `tasks` and `greet`.
-
-## Recording Management
-
-- Temporary WAV recordings are removed by default.
-- `--save-recordings` keeps recordings.
-- `--output-dir PATH` controls where saved recordings are written.
-
-## Install And Launch
-
-- `install.sh` copies the default config to `~/.config/fluid-push-to-talk/config.json`.
-- `install.sh` also runs `swift build`.
-- `fluid-push-to-talk setup` opens the guided onboarding wizard.
-- `fluid-push-to-talk config`, `config show`, and `config doctor` manage installed configuration.
-- `launch.sh` runs the built debug binary and forwards CLI arguments.
-- The binary includes `--test-command-information` and `--test-command` for command-result regression tests without loading the ASR model.
-
-## macOS Permissions
-
-- Requires Microphone permission for audio capture.
-- Requires Accessibility and Input Monitoring permissions for paste/hotkey behavior.
+- Paste, dump, and Bluetooth routes independently support `clipboard`, `dump`, and `bluetooth-keyboard`.
+- Clipboard delay and restoration remain configurable.
+- Temporary WAV recordings are removed unless `--save-recordings` is enabled.

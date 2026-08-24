@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 import json
-import os
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BINARY = REPO_ROOT / "app" / ".build" / "debug" / "fluid-push-to-talk"
 
 
-def run_command(args: list[str], *, input_text: str = "", env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
+def require(condition: bool, message: str) -> bool:
+    if condition:
+        return False
+    print(f"config wizard regression: {message}", file=sys.stderr)
+    return True
+
+
+def run(args: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         [str(BINARY), *args],
         cwd=REPO_ROOT,
@@ -20,227 +25,100 @@ def run_command(args: list[str], *, input_text: str = "", env: Optional[dict[str
         text=True,
         capture_output=True,
         timeout=20,
-        env=env,
     )
-    print(completed.stdout, end="")
+    if completed.stdout:
+        print(completed.stdout, end="")
     if completed.stderr:
         print(completed.stderr, end="", file=sys.stderr)
     return completed
 
 
-def assert_true(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
 def main() -> int:
-    help_output = run_command(["--help"])
-    assert_true(help_output.returncode == 0, "help command failed")
-    for expected in ["setup [--config PATH]", "config [show|doctor|reset]", "config doctor", "config reset --yes"]:
-        assert_true(expected in help_output.stdout, f"help output missing {expected!r}")
-    assert_true("--test-command-image PATH" in help_output.stdout, "help output must expose image context test input")
+    failed = False
+    wizard = (REPO_ROOT / "app" / "Sources" / "CLI" / "ConfigWizard.swift").read_text(encoding="utf-8")
+    options = (REPO_ROOT / "app" / "Sources" / "CLI" / "Options.swift").read_text(encoding="utf-8")
+    config_source = (REPO_ROOT / "app" / "Sources" / "Config" / "AppConfig.swift").read_text(encoding="utf-8")
 
-    checked_in_config = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
-    assert_true("api_key" not in checked_in_config.get("local_llm", {}), "checked-in config must not store api_key")
-    wizard_source = (REPO_ROOT / "app" / "Sources" / "CLI" / "ConfigWizard.swift").read_text(encoding="utf-8")
-    assert_true("let pollInterval: useconds_t = 50_000" in wizard_source, "shortcut capture must poll at 50ms")
-    assert_true("let stableDuration: TimeInterval = 0.35" in wizard_source, "shortcut capture must wait for a stable shortcut")
-    assert_true("Simple Setup (recommended)" in wizard_source, "setup wizard must expose Simple Setup")
-    assert_true("Advanced Setup" in wizard_source, "setup wizard must expose Advanced Setup")
-    assert_true("Transcription language" in wizard_source, "setup wizard must expose ASR language onboarding")
-    assert_true("System Language" in wizard_source, "setup wizard must default ASR language to system")
-    assert_true("Enable Hermes Agent?" in wizard_source, "advanced setup wizard must expose Hermes Agent onboarding")
-    assert_true("Enable Bluetooth keyboard output?" in wizard_source, "advanced setup wizard must expose Bluetooth onboarding")
-    assert_true("hermesTriggerSummary" in wizard_source, "setup wizard must explain the Hermes trigger")
-    assert_true(
-        "Hold the shortcut now. Release when captured." in wizard_source,
-        "shortcut capture must use polished English CLI copy",
-    )
-    for forbidden in [
-        "auswaehlen",
-        "Abgebrochen",
-        "zurueck",
-        "aktivieren",
-        "Pfad",
-        "Ungueltig",
-        "Deaktiviert",
-        "Konfiguration",
-        "fuer",
-        "behalte",
-        "fehlgeschlagen",
+    for needle, source, message in [
+        ("Transcription language", wizard, "onboarding must ask for transcription language"),
+        ('label: "Paste Shortcut"', wizard, "onboarding must configure the paste shortcut"),
+        ("Choose command provider", wizard, "onboarding must ask for a command provider"),
+        ("OpenAI", wizard, "onboarding must offer OpenAI"),
+        ("Cerebras", wizard, "onboarding must offer Cerebras"),
+        ("full-desktop screenshot", wizard, "onboarding must explain screenshot context"),
+        ("Request Screen Recording permission now?", wizard, "onboarding must offer Screen Recording permission"),
+        ("every mode continues with text only.", wizard, "onboarding must explain text-only fallback"),
+        ("Choose Control + Option mode", wizard, "onboarding must select Markdown Dump or Hermes"),
+        ("Edit optional features", wizard, "config menu must separate optional features"),
+        ("command provider", wizard.lower(), "optional config must retain provider context"),
+        ('chmod(url.path, S_IRUSR | S_IWUSR)', wizard, ".env writer must enforce mode 0600"),
+        ("didReplace", wizard, ".env writer must preserve existing entries"),
+        ("if configExists {", wizard, "existing setup must use a preservation branch"),
+        ("config.asr.language = AsrLanguageResolver.normalizePreference", wizard, "existing setup may normalize only schema-safe language state"),
+        ("} else {\n            normalizeInstallLocalDefaults(&config)", wizard, "install-only defaults must apply only to new configs"),
+        ('case commandProvider = "command_provider"', config_source, "command_provider config key is missing"),
+        ('case controlOptionMode = "control_option_mode"', config_source, "control_option_mode config key is missing"),
+        ("gpt-5.6-luna", options, "CLI help must explain the OpenAI model"),
+        ("gemma-4-31b", options, "CLI help must explain the Cerebras model"),
     ]:
-        assert_true(forbidden not in wizard_source, f"wizard source must not contain German prompt fragment {forbidden!r}")
-    options_source = (REPO_ROOT / "app" / "Sources" / "CLI" / "Options.swift").read_text(encoding="utf-8")
-    app_config_source = (REPO_ROOT / "app" / "Sources" / "Config" / "AppConfig.swift").read_text(encoding="utf-8")
-    assert_true("case cerebras" in app_config_source, "local LLM config must support provider=cerebras")
-    assert_true("imageContextEnabled" in app_config_source, "local LLM config must support image context toggle")
-    llm_client_source = (REPO_ROOT / "app" / "Sources" / "LocalLLM" / "AzureOpenAICommandLLMClient.swift").read_text(encoding="utf-8")
-    assert_true("case topP = \"top_p\"" in llm_client_source, "chat completions requests must support Cerebras top_p")
-    assert_true("imageURL = \"image_url\"" in llm_client_source, "chat completions requests must support image_url parts")
-    assert_true(
-        "options.testCommandInformation != nil || options.testCommand != nil" in options_source,
-        "missing API keys must not abort normal dictation startup",
-    )
-    readiness_source = (REPO_ROOT / "app" / "Sources" / "LocalLLM" / "LocalLLMReadinessMonitor.swift").read_text(encoding="utf-8")
-    assert_true(
-        "dictation stays available" in readiness_source,
-        "readiness monitor must warn without blocking dictation when hosted API keys are missing",
-    )
+        failed |= require(needle in source, message)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        config_path = Path(temp_dir) / "config.json"
-        setup = run_command(["setup", "--config", str(config_path)], input_text="\n\n\n\n\n\n\n")
-        assert_true(setup.returncode == 0, "setup wizard failed with empty token")
-        assert_true("Simple Setup (recommended)" in setup.stdout, "setup must show Simple Setup")
-        assert_true("Advanced Setup" in setup.stdout, "setup must show Advanced Setup")
-        assert_true("Transcription language" in setup.stdout, "setup must ask for ASR language")
-        assert_true("Selection [1] (q to quit):" in setup.stdout, "setup must use the English selection prompt")
-        assert_true("Bluetooth" not in setup.stdout, "simple setup must not mention Bluetooth")
-        assert_true("Hermes" not in setup.stdout, "simple setup must not mention Hermes")
-        assert_true((Path(temp_dir) / ".env").exists(), "setup must create .env even when token is empty")
-        simple_config = json.loads(config_path.read_text(encoding="utf-8"))
-        assert_true(simple_config["asr"]["language"] == "system", "simple setup must default ASR language to system")
-        assert_true(
-            simple_config["hermes_agent"]["enabled"] is False,
-            "simple setup must disable Hermes Agent",
-        )
-        assert_true(
-            simple_config["dump"]["enabled"] is False,
-            "simple setup must disable Markdown dump",
-        )
-        assert_true(
-            simple_config["continuous_dump"]["enabled"] is False,
-            "simple setup must disable continuous dump",
-        )
-        assert_true(
-            simple_config["hotkeys"]["bluetooth"]["keys"] == [],
-            "simple setup must leave Bluetooth hotkey disabled",
-        )
-        assert_true(
-            simple_config["hotkeys"]["bluetooth"]["enabled"] is False,
-            "simple setup must write Bluetooth hotkey enabled=false",
-        )
-        assert_true(
-            simple_config["llm_output"]["bluetooth"] == "clipboard",
-            "simple setup must leave Bluetooth output local",
-        )
-        assert_true(
-            simple_config["local_llm"]["image_context_enabled"] is False,
-            "simple setup must keep image context disabled for generic OpenAI-compatible defaults",
-        )
-        assert_true(
-            simple_config["llm_output"]["dump"] == "clipboard",
-            "simple setup must keep dump output local/inactive",
-        )
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        config_path = Path(temp_dir) / "config.json"
-        advanced_input = "2\n" + ("\n" * 15)
-        advanced = run_command(["setup", "--config", str(config_path)], input_text=advanced_input)
-        assert_true(advanced.returncode == 0, "advanced setup wizard failed")
-        assert_true("Configure provider, shortcuts, command mode, Markdown dump, Hermes Agent, Bluetooth keyboard output, and paths." in advanced.stdout, "advanced setup must explain advanced capabilities")
-        assert_true("Hermes Agent Trigger" in advanced.stdout, "advanced setup must expose Hermes")
-        assert_true("Enable Bluetooth keyboard output?" in advanced.stdout, "advanced setup must expose Bluetooth")
-        assert_true("Configure Dump Shortcut" in advanced.stdout, "advanced setup must expose dump shortcut setup")
-        advanced_config = json.loads(config_path.read_text(encoding="utf-8"))
-        assert_true(advanced_config["dump"]["enabled"] is True, "advanced setup must enable Markdown dump")
-        assert_true(advanced_config["continuous_dump"]["enabled"] is True, "advanced setup must enable continuous dump")
-        assert_true(advanced_config["llm_output"]["dump"] == "dump", "advanced setup must default dump output to Markdown")
+    for forbidden in ["Simple Setup (recommended)", "Advanced Setup", "OpenAI-compatible API preset", "Local MLX"]:
+        failed |= require(forbidden not in wizard, f"obsolete onboarding choice remains: {forbidden}")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         config_path = Path(temp_dir) / "config.json"
         dotenv_path = Path(temp_dir) / ".env"
-        config_path.write_text('{"local_llm":{"api_key":"bad","provider":"mlx"}}', encoding="utf-8")
+        config_path.write_text('{"local_llm":{"provider":"mlx"},"skills":{"directory":"old"}}', encoding="utf-8")
         dotenv_path.write_text("OPENAI_API_KEY=remove-me\nOTHER_SECRET=remove-me-too\n", encoding="utf-8")
-
-        reset = run_command(["config", "reset", "--yes", "--config", str(config_path)])
-        assert_true(reset.returncode == 0, "config reset failed")
+        reset = run(["config", "reset", "--yes", "--config", str(config_path)])
+        failed |= require(reset.returncode == 0, "config reset failed")
         reset_config = json.loads(config_path.read_text(encoding="utf-8"))
-        assert_true(reset_config["asr"]["language"] == "system", "config reset must default ASR language to system")
-        assert_true("api_key" not in reset_config.get("local_llm", {}), "config reset must not write api_key")
-        assert_true(reset_config["local_llm"]["api_key_env"] == "OPENAI_API_KEY", "config reset must use OPENAI_API_KEY")
-        assert_true(reset_config["hermes_agent"]["enabled"] is False, "config reset must disable Hermes by default")
-        assert_true(reset_config["hermes_agent"]["workdir"] == "~", "config reset must keep Hermes workdir local-user neutral")
-        assert_true(reset_config["dump"]["enabled"] is False, "config reset must use simple dump defaults")
-        assert_true(reset_config["continuous_dump"]["enabled"] is False, "config reset must use simple continuous dump defaults")
-        assert_true(reset_config["hotkeys"]["bluetooth"]["enabled"] is False, "config reset must disable Bluetooth")
-        assert_true(reset_config["hotkeys"]["bluetooth"]["keys"] == [], "config reset must clear Bluetooth keys")
-        assert_true(reset_config["llm_output"]["bluetooth"] == "clipboard", "config reset must keep Bluetooth output inactive")
-        assert_true("/Users/dominik/" not in json.dumps(reset_config), "config reset must remove old absolute user paths")
-        assert_true(dotenv_path.exists(), "config reset must create an empty .env")
-        assert_true("OPENAI_API_KEY" not in dotenv_path.read_text(encoding="utf-8"), "config reset must remove local secrets")
+        failed |= require("local_llm" not in reset_config, "config reset must remove local_llm")
+        failed |= require("skills" not in reset_config, "config reset must remove skills")
+        failed |= require(reset_config.get("asr", {}).get("language") == "system", "config reset must default language to system")
+        failed |= require(reset_config.get("control_option_mode") == "dump", "config reset must default Control + Option to dump")
+        failed |= require("enabled" not in reset_config.get("hermes_agent", {}), "config reset must not write legacy hermes_agent.enabled")
+        failed |= require(reset_config.get("hotkeys", {}).get("bluetooth", {}).get("enabled") is False, "config reset must disable Bluetooth")
+        failed |= require("OPENAI_API_KEY" not in dotenv_path.read_text(encoding="utf-8"), "config reset must clear secrets")
+        failed |= require(stat.S_IMODE(dotenv_path.stat().st_mode) == 0o600, ".env must use mode 0600")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         config_path = Path(temp_dir) / "config.json"
         dotenv_path = Path(temp_dir) / ".env"
-        dotenv_path.write_text("OTHER_SECRET=keep-me\nOPENAI_API_KEY=old\n", encoding="utf-8")
+        existing = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
+        existing["asr"]["model_version"] = "v2"
+        existing["audio_input"] = {"device_uid": "custom-uid", "device_name": "Custom Mic"}
+        existing["dump"]["markdown_file"] = "~/Custom/Daily/YYYY-MM-DD.md"
+        existing["hermes_agent"]["workdir"] = "~/CustomHermes"
+        existing["bluetooth_keyboard"] = {"port": "/dev/cu.custom", "chunk_size": 64}
+        existing["local_llm"] = {"provider": "mlx"}
+        existing["skills"] = {"directory": "old"}
+        config_path.write_text(json.dumps(existing), encoding="utf-8")
+        dotenv_path.write_text("OTHER_SECRET=keep-me\nOPENAI_API_KEY=old-key\nCEREBRAS_API_KEY=keep-cerebras\n", encoding="utf-8")
 
-        setup_input = "\n\n\n\n\nsk-new-secret-1234\n\n\n"
-        setup = run_command(["setup", "--config", str(config_path)], input_text=setup_input)
-        assert_true(setup.returncode == 0, "setup wizard failed")
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        local_llm = config["local_llm"]
-        assert_true(config["asr"]["language"] == "system", "default setup must use system ASR language")
-        assert_true(local_llm["provider"] == "openai_compatible", "default setup must use OpenAI-compatible provider")
-        assert_true(local_llm["base_url"] == "https://api.openai.com/v1", "default setup must use OpenAI base URL")
-        assert_true(local_llm["api_key_env"] == "OPENAI_API_KEY", "default setup must use generic OPENAI_API_KEY")
-        assert_true("api_key" not in local_llm, "setup config must not write api_key")
-        assert_true(local_llm["dotenv_file"] == ".env", "setup must keep local .env reference")
-        assert_true(config["skills"]["directory"] == str(REPO_ROOT / "skills"), "setup must point skills at current repo")
-        assert_true(config["hermes_agent"]["enabled"] is False, "default setup must disable Hermes Agent")
-        assert_true(config["hermes_agent"]["workdir"] == "~", "default setup must keep Hermes workdir user-neutral")
-        assert_true("/Users/dominik/" not in config["dump"]["markdown_file"], "setup must not keep old Dominik daily-note path")
-        assert_true(config["dump"]["enabled"] is False, "default setup must disable Markdown dump")
-        assert_true(config["continuous_dump"]["enabled"] is False, "default setup must disable continuous dump")
-        assert_true(config["hotkeys"]["bluetooth"]["keys"] == [], "default setup must not enable Bluetooth hotkey")
-        assert_true(config["hotkeys"]["bluetooth"]["enabled"] is False, "default setup must write Bluetooth enabled=false")
-        assert_true(config["llm_output"]["bluetooth"] == "clipboard", "default setup must not enable Bluetooth output")
-        assert_true(config["llm_output"]["dump"] == "clipboard", "default setup must keep dump output local/inactive")
+        setup = run(
+            ["setup", "--config", str(config_path)],
+            input_text="\n\n1\nsk-new-secret-1234\n1\n\ny\n",
+        )
+        failed |= require(setup.returncode == 0, "piped core setup failed")
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        failed |= require(saved["asr"]["model_version"] == "v2", "core setup must preserve the ASR model version")
+        failed |= require(saved["audio_input"] == existing["audio_input"], "core setup must preserve the selected microphone")
+        failed |= require(saved["dump"]["markdown_file"] == existing["dump"]["markdown_file"], "core setup must preserve the dump path")
+        failed |= require(saved["hermes_agent"]["workdir"] == existing["hermes_agent"]["workdir"], "core setup must preserve the Hermes workdir")
+        failed |= require(saved["bluetooth_keyboard"] == existing["bluetooth_keyboard"], "core setup must preserve Bluetooth settings")
+        failed |= require(saved["control_option_mode"] == "dump", "core setup must save the selected Control + Option mode")
+        failed |= require("enabled" not in saved["hermes_agent"], "core setup must remove legacy hermes_agent.enabled")
+        failed |= require("local_llm" not in saved and "skills" not in saved, "core setup must remove legacy fields")
         dotenv = dotenv_path.read_text(encoding="utf-8")
-        assert_true("OTHER_SECRET=keep-me" in dotenv, ".env update must preserve unrelated keys")
-        assert_true("OPENAI_API_KEY=sk-new-secret-1234" in dotenv, ".env update must replace OpenAI key")
+        failed |= require("OTHER_SECRET=keep-me" in dotenv, "core setup must preserve unrelated secrets")
+        failed |= require("OPENAI_API_KEY=sk-new-secret-1234" in dotenv, "core setup must update the OpenAI key")
+        failed |= require("CEREBRAS_API_KEY=keep-cerebras" in dotenv, "core setup must preserve the Cerebras key")
+        failed |= require(stat.S_IMODE(dotenv_path.stat().st_mode) == 0o600, "core setup must enforce .env mode 0600")
 
-        show = run_command(["config", "show", "--config", str(config_path)])
-        assert_true(show.returncode == 0, "config show failed")
-        assert_true("sk-new-secret-1234" not in show.stdout, "config show must not print raw API key")
-        assert_true("sk-n...1234" in show.stdout, "config show must print masked API key")
-        assert_true("Hermes Agent: disabled" in show.stdout, "config show must include Hermes Agent status")
-
-        openai_config = config
-        openai_config["local_llm"]["enabled"] = True
-        openai_config["local_llm"]["command_generation_enabled"] = True
-        openai_config["local_llm"]["provider"] = "openai_compatible"
-        openai_config["local_llm"]["base_url"] = "https://example.test/v1"
-        openai_config["local_llm"]["endpoint"] = ""
-        openai_config["local_llm"]["model"] = "custom-model"
-        openai_config["local_llm"]["api_key_env"] = "OPENAI_API_KEY"
-        config_path.write_text(json.dumps(openai_config), encoding="utf-8")
-        dotenv_path.write_text(dotenv.replace("OPENAI_API_KEY=sk-new-secret-1234", "OPENAI_API_KEY=sk-compatible"), encoding="utf-8")
-
-        doctor = run_command(["config", "doctor", "--config", str(config_path)])
-        assert_true(doctor.returncode == 0, "config doctor failed")
-        assert_true(
-            "https://example.test/v1/chat/completions" in doctor.stdout,
-            "doctor must show normalized OpenAI-compatible chat completions URL",
-        )
-
-        openai_config["local_llm"]["base_url"] = "http://localhost:1234/v1"
-        openai_config["local_llm"]["api_key_env"] = ""
-        config_path.write_text(json.dumps(openai_config), encoding="utf-8")
-        local_doctor = run_command(["config", "doctor", "--config", str(config_path)])
-        assert_true(local_doctor.returncode == 0, "config doctor failed for no-token local endpoint")
-        assert_true(
-            "requests are sent without Authorization" in local_doctor.stdout,
-            "doctor must allow OpenAI-compatible local endpoints without an API key",
-        )
-
-    print("config wizard checks passed")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except AssertionError as error:
-        print(f"config wizard regression: {error}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())

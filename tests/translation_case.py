@@ -14,29 +14,18 @@ COMMAND = "Bitte auf Englisch übersetzen."
 MAX_ATTEMPTS = 3
 
 
-def hosted_llm_config() -> tuple[str, str, str, str]:
-    if os.environ.get("COMMAND_LLM_API_KEY_ENV"):
-        api_key_env = os.environ["COMMAND_LLM_API_KEY_ENV"]
-    elif os.environ.get("CEREBRAS_API_KEY"):
-        api_key_env = "CEREBRAS_API_KEY"
-    else:
-        api_key_env = "OPENAI_API_KEY"
-
-    if api_key_env == "CEREBRAS_API_KEY":
-        return (
-            "cerebras",
-            os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
-            os.environ.get("CEREBRAS_MODEL", "gemma-4-31b"),
-            api_key_env,
-        )
-
-    return (
-        "openai_compatible",
-        os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
-        api_key_env,
-    )
-
+def resolve_api_key() -> str:
+    value = os.environ.get("OPENAI_API_KEY", "").strip()
+    if value:
+        return value
+    dotenv = Path.home() / ".config" / "fluid-push-to-talk" / ".env"
+    if not dotenv.exists():
+        return ""
+    for line in dotenv.read_text(encoding="utf-8").splitlines():
+        key, separator, raw = line.partition("=")
+        if separator and key.strip() == "OPENAI_API_KEY":
+            return raw.strip().strip("'\"")
+    return ""
 
 def run_once(config_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -60,12 +49,6 @@ def validate(completed: subprocess.CompletedProcess[str]) -> bool:
     if completed.returncode != 0:
         return False
 
-    command_index = completed.stdout.find(COMMAND)
-    information_index = completed.stdout.find(SOURCE)
-    if command_index == -1 or information_index == -1 or command_index > information_index:
-        print("translation regression: LLM request did not put command before information", file=sys.stderr)
-        return False
-
     result_lines = [
         line.removeprefix("[result] ").strip()
         for line in completed.stdout.splitlines()
@@ -87,27 +70,18 @@ def validate(completed: subprocess.CompletedProcess[str]) -> bool:
 
 def main() -> int:
     config = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
-    provider, base_url, model, api_key_env = hosted_llm_config()
     config["prompt_config_file"] = str(REPO_ROOT / "config" / "promptConfig.json")
-    config.setdefault("local_llm", {})
-    config["local_llm"]["enabled"] = True
-    config["local_llm"]["command_generation_enabled"] = True
-    config["local_llm"]["provider"] = provider
-    config["local_llm"]["endpoint"] = ""
-    config["local_llm"]["base_url"] = base_url
-    config["local_llm"]["model"] = model
-    config["local_llm"]["api_key_env"] = api_key_env
-    if provider == "cerebras":
-        config["local_llm"]["temperature"] = 1
-        config["local_llm"]["top_p"] = 0.95
-        config["local_llm"]["max_tokens"] = 32768
-        config["local_llm"]["image_context_enabled"] = True
-    config.setdefault("debug", {})
-    config["debug"]["log_llm_requests"] = True
+    api_key = resolve_api_key()
+    if not api_key:
+        print("translation regression: OPENAI_API_KEY is unavailable", file=sys.stderr)
+        return 2
 
     temp_dir = tempfile.TemporaryDirectory()
     config_path = Path(temp_dir.name) / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
+    dotenv_path = Path(temp_dir.name) / ".env"
+    dotenv_path.write_text(f"OPENAI_API_KEY={api_key}\n", encoding="utf-8")
+    dotenv_path.chmod(0o600)
 
     last_completed = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -119,7 +93,7 @@ def main() -> int:
         if validate(completed):
             return 0
         if attempt < MAX_ATTEMPTS:
-            print(f"translation regression: retrying live OpenAI-compatible command ({attempt + 1}/{MAX_ATTEMPTS})")
+            print(f"translation regression: retrying live OpenAI Responses command ({attempt + 1}/{MAX_ATTEMPTS})")
     if last_completed and last_completed.returncode != 0:
         return last_completed.returncode
     return 1

@@ -10,11 +10,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app"
 BINARY = APP_DIR / ".build" / "debug" / "fluid-push-to-talk"
-REQUIRED_COMMAND_LLM_MODEL = "gpt-5.4-mini"
-REQUIRED_COMMAND_LLM_PROVIDER = "openai_compatible"
-REQUIRED_COMMAND_LLM_BASE_URL = "https://api.openai.com/v1"
-
-
 def color(text: str, code: str) -> str:
     if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
         return text
@@ -44,40 +39,19 @@ def run(name: str, command: list[str], cwd: Path = REPO_ROOT, timeout: int = 120
 def validate_config() -> bool:
     print(color("==> config expectations", "36"))
     config = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
-    local_llm = config["local_llm"]
     errors = []
     if config.get("asr", {}).get("language") != "system":
         errors.append("asr.language must default to system")
-    if local_llm.get("command_generation_enabled") is not True:
-        errors.append("local_llm.command_generation_enabled must default to true")
-    if local_llm.get("provider") != REQUIRED_COMMAND_LLM_PROVIDER:
-        errors.append(f"local_llm.provider must be {REQUIRED_COMMAND_LLM_PROVIDER}")
-    if local_llm["model"] != REQUIRED_COMMAND_LLM_MODEL:
-        errors.append(f"local_llm.model must be {REQUIRED_COMMAND_LLM_MODEL}")
-    if local_llm.get("base_url") != REQUIRED_COMMAND_LLM_BASE_URL:
-        errors.append("local_llm.base_url must use the configured OpenAI-compatible base URL")
-    if local_llm.get("api_key_env") != "OPENAI_API_KEY":
-        errors.append("local_llm.api_key_env must default to OPENAI_API_KEY")
-    if "api_key" in local_llm:
-        errors.append("local_llm.api_key must not be stored in JSON; use .env")
-    if local_llm.get("dotenv_file") != ".env":
-        errors.append("local_llm.dotenv_file must default to .env")
-    if local_llm["temperature"] != 0:
-        errors.append("local_llm.temperature must be 0 for deterministic fast command generation")
-    if local_llm.get("top_p") is not None:
-        errors.append("local_llm.top_p must default to null for deterministic generic command generation")
-    if local_llm["max_tokens"] > 128:
-        errors.append("local_llm.max_tokens should stay small for latency")
-    if local_llm.get("image_context_enabled") is not False:
-        errors.append("local_llm.image_context_enabled must default to false unless a multimodal provider is explicitly configured")
-    if local_llm.get("request_timeout_seconds") != 15:
-        errors.append("local_llm.request_timeout_seconds must allow normal hosted API variance without old single-request stalls")
-    if local_llm.get("max_retries") != 1:
-        errors.append("local_llm.max_retries must retry one transient hosted API timeout without flooding the rate limit")
-    if local_llm.get("cache_size") != 4096:
-        errors.append("local_llm.cache_size must stay positive for MLX fallback compatibility")
-    if local_llm.get("memory_size") != 4096:
-        errors.append("local_llm.memory_size must stay positive for MLX fallback compatibility")
+    if "local_llm" in config:
+        errors.append("legacy local_llm configuration must be removed")
+    if "skills" in config:
+        errors.append("legacy skills configuration must be removed")
+    if config.get("command_provider") != "openai":
+        errors.append("command_provider must default to openai")
+    if config.get("control_option_mode") != "dump":
+        errors.append("control_option_mode must default to dump")
+    if "enabled" in config.get("hermes_agent", {}):
+        errors.append("legacy hermes_agent.enabled must not be written")
     if config.get("text_replacements_file") != "textReplacements.json":
         errors.append("text_replacements_file must default to textReplacements.json")
     if "/Users/dominik/" in json.dumps(config) or "/Users/sebastianmertens" in json.dumps(config):
@@ -91,6 +65,8 @@ def validate_config() -> bool:
         errors.append("llm_output must configure paste, dump, and bluetooth with supported output methods")
     if llm_output.get("paste") != "clipboard":
         errors.append("Command + Option must remain configured for local clipboard paste")
+    if llm_output.get("dump") != "dump":
+        errors.append("Markdown Control + Option mode must default to dump output")
     if llm_output.get("bluetooth") != "clipboard":
         errors.append("Bluetooth output must default to clipboard while the Bluetooth hotkey is disabled")
     bluetooth_hotkey = config.get("hotkeys", {}).get("bluetooth", {})
@@ -133,6 +109,8 @@ def validate_help() -> bool:
         "--test-command-information",
         "--test-command",
         "--test-command-image",
+        "--test-hermes-instruction",
+        "Control + Option is selected during setup",
     ]
     missing = [item for item in expected if item not in completed.stdout]
     if completed.returncode != 0 or missing:
@@ -144,26 +122,6 @@ def validate_help() -> bool:
     return True
 
 
-def validate_skill_frontmatter() -> bool:
-    print(color("==> skill frontmatter", "36"))
-    failed = False
-    for skill in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
-        lines = skill.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 4 or lines[0] != "---":
-            print(f"skill frontmatter regression: {skill} must start with YAML frontmatter", file=sys.stderr)
-            failed = True
-            continue
-        header = "\n".join(lines[:8])
-        if "name:" not in header or "description:" not in header:
-            print(f"skill frontmatter regression: {skill} needs name and description", file=sys.stderr)
-            failed = True
-    if failed:
-        print(color("FAIL skill frontmatter", "31"), file=sys.stderr)
-        return False
-    print(color("PASS skill frontmatter", "32"))
-    return True
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run LocalPTT automated regression checks.")
     parser.add_argument(
@@ -171,18 +129,24 @@ def main() -> int:
         action="store_true",
         help="Skip the live command LLM regressions.",
     )
+    parser.add_argument(
+        "--live-multi-image",
+        action="store_true",
+        help="Run optional five-image live checks for configured provider credentials.",
+    )
     args = parser.parse_args()
 
     checks = [
         run("swift build", ["swift", "build"], cwd=APP_DIR),
+        run("swift tests", ["swift", "test"], cwd=APP_DIR),
         run("config JSON", ["python3", "-m", "json.tool", "config/config.json"]),
         run("prompt JSON", ["python3", "-m", "json.tool", "config/promptConfig.json"]),
         run("text replacements JSON", ["python3", "-m", "json.tool", "config/textReplacements.json"]),
         validate_config(),
         validate_help(),
-        validate_skill_frontmatter(),
         run("audio recorder static regression", ["python3", "tests/audio_recorder_static_case.py"]),
         run("hotkey command-mode static regression", ["python3", "tests/hotkey_command_mode_static_case.py"]),
+        run("command screenshot P-key regression", ["python3", "tests/command_screenshot_hotkey_static_case.py"]),
         run("Hermes shortcut static regression", ["python3", "tests/hermes_shortcut_static_case.py"]),
         run("paste spacing static regression", ["python3", "tests/paste_spacing_static_case.py"]),
         run("terminal launch static regression", ["python3", "tests/terminal_launch_static_case.py"]),
@@ -191,19 +155,24 @@ def main() -> int:
         run("continuous dump static regression", ["python3", "tests/continuous_dump_static_case.py"]),
         run("Bluetooth keyboard static regression", ["python3", "tests/bluetooth_keyboard_static_case.py"]),
         run("Bluetooth keyboard protocol regression", ["python3", "tests/bluetooth_keyboard_protocol_case.py"]),
-        run("command LLM provider static regression", ["python3", "tests/local_llm_model_static_case.py"]),
+        run("OpenAI Responses static regression", ["python3", "tests/openai_responses_static_case.py"]),
+        run("command provider static regression", ["python3", "tests/command_provider_static_case.py"]),
+        run("command diagnostics static regression", ["python3", "tests/command_diagnostics_static_case.py"]),
         run("config wizard regression", ["python3", "tests/config_wizard_case.py"]),
+        run("command provider piped onboarding regression", ["python3", "tests/command_provider_wizard_case.py"]),
         run("text replacement static regression", ["python3", "tests/text_replacement_static_case.py"]),
-        run("tasks skill regression", ["python3", "tests/tasks_skill_case.py"]),
-        run("command LLM toggle regression", ["python3", "tests/command_llm_toggle_case.py"]),
-        run("generic skill tool regression", ["python3", "tests/generic_tool_case.py"]),
     ]
     if not args.skip_llm:
-        checks.append(run("OpenAI-compatible command LLM smoke regression", ["python3", "tests/local_llm_speed_case.py"], timeout=60))
-        checks.append(run("OpenAI-compatible command translation regression", ["python3", "tests/translation_case.py"], timeout=150))
+        checks.append(run("OpenAI Responses command smoke regression", ["python3", "tests/openai_responses_live_case.py"], timeout=60))
+        checks.append(run("OpenAI Responses command translation regression", ["python3", "tests/translation_case.py"], timeout=150))
     else:
-        print(color("SKIP OpenAI-compatible command LLM smoke regression", "33"))
-        print(color("SKIP OpenAI-compatible command translation regression", "33"))
+        print(color("SKIP OpenAI Responses command smoke regression", "33"))
+        print(color("SKIP OpenAI Responses command translation regression", "33"))
+    if args.live_multi_image:
+        checks.append(run("OpenAI five-image live regression", ["python3", "tests/provider_multi_image_live_case.py", "--provider", "openai"], timeout=100))
+        checks.append(run("Cerebras five-image live regression", ["python3", "tests/provider_multi_image_live_case.py", "--provider", "cerebras"], timeout=100))
+    else:
+        print(color("SKIP optional provider five-image live regressions", "33"))
 
     return 0 if all(checks) else 1
 

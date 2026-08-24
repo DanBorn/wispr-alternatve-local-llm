@@ -12,63 +12,23 @@ enum RuntimeCommand {
 }
 
 enum ConfigWizard {
-    private static let defaultOpenAIBaseURL = "https://api.openai.com/v1"
-    private static let defaultOpenAIModel = "gpt-5.4-mini"
-    private static let defaultOpenAIAPIKeyEnv = "OPENAI_API_KEY"
-    private static let defaultAzureEndpoint = "https://dparnold-2501-resource.services.ai.azure.com/openai/v1/chat/completions"
-    private static let defaultCerebrasBaseURL = "https://api.cerebras.ai/v1"
-    private static let defaultCerebrasModel = "gemma-4-31b"
-    private static let defaultCerebrasAPIKeyEnv = "CEREBRAS_API_KEY"
-    private static let defaultCerebrasTemperature = 1.0
-    private static let defaultCerebrasTopP = 0.95
-    private static let defaultCerebrasMaxTokens = 32768
-
     static func runSetup(configPath: URL?) throws {
         let paths = ConfigPaths(configPath: configPath)
         let input = WizardInput()
         var config = try loadWizardBaseConfig(paths: paths)
 
         printHeader("Local Audio Setup")
-        let profile = input.choose(
-            prompt: "Choose setup mode",
-            options: [
-                "Simple Setup (recommended)",
-                "Advanced Setup",
-            ],
-            defaultIndex: 0,
-            marksDefaultOption: false
-        )
-
         var secretUpdates: [String: String] = [:]
-        switch profile {
-        case 0:
-            printModeDescription(
-                "Dictate text, paste transcripts, and optionally use command mode with an OpenAI-compatible API."
-            )
-            applySimpleSetup(to: &config)
-            configureASR(config: &config, input: input)
-            configureOpenAICompatible(
-                config: &config,
-                input: input,
-                secretUpdates: &secretUpdates,
-                choosePreset: false
-            )
-            configurePasteShortcut(config: &config, input: input)
-        default:
-            printModeDescription(
-                "Configure provider, shortcuts, command mode, Markdown dump, Hermes Agent, Bluetooth keyboard output, and paths."
-            )
-            applyAdvancedSetup(to: &config)
-            configureASR(config: &config, input: input)
-            configureCommandLLM(config: &config, input: input, secretUpdates: &secretUpdates)
-            configureShortcuts(config: &config, input: input)
-            configureHermesAgent(config: &config, input: input)
-            configureBluetooth(config: &config, input: input)
-            configureOutputs(config: &config, input: input)
-            configureDailyNote(config: &config, input: input)
-        }
-
-        review(config: config, paths: paths, includeAdvanced: profile == 1)
+        printModeDescription(
+            "Local transcription stays on your Mac. Command mode sends your transcript, instruction, and (when permitted) screenshots to the selected command provider."
+        )
+        configureASR(config: &config, input: input)
+        configurePasteShortcut(config: &config, input: input)
+        configureCommandProvider(config: &config, input: input)
+        configureProviderKey(config: config, input: input, secretUpdates: &secretUpdates)
+        configureControlOptionMode(config: &config, input: input)
+        explainScreenRecording(input: input)
+        review(config: config, paths: paths, includeOptionalFeatures: false)
         guard input.confirm(prompt: "Save this configuration?", defaultValue: true) else {
             print("Canceled. No changes were written.")
             return
@@ -78,13 +38,56 @@ enum ConfigWizard {
         print("Setup saved: \(paths.configURL.path)")
     }
 
+    private static func runOptionalFeaturesEditor(configPath: URL?) throws {
+        let paths = ConfigPaths(configPath: configPath)
+        let input = WizardInput()
+        var config = try loadWizardBaseConfig(paths: paths)
+
+        printHeader("Optional Features")
+        printModeDescription(
+            "Configure the Control + Option mode, Hermes details, continuous Markdown dump, Bluetooth output, and paths. Command provider selection remains in core setup."
+        )
+        configureDumpShortcut(config: &config, input: input)
+        configureControlOptionMode(config: &config, input: input)
+        config.continuousDump.enabled = input.confirm(
+            prompt: "Enable stop-triggered continuous dump?",
+            defaultValue: config.continuousDump.enabled
+        )
+        if config.continuousDump.enabled {
+            config.dump.enabled = true
+        }
+        configureHermesAgent(config: &config, input: input)
+        configureBluetooth(config: &config, input: input)
+        configureOutputs(config: &config, input: input)
+        if config.continuousDump.enabled, config.controlOptionMode != .dump {
+            configureDailyNote(config: &config, input: input)
+        }
+        config.recordings.save = input.confirm(
+            prompt: "Keep audio recordings?",
+            defaultValue: config.recordings.save
+        )
+        config.recordings.outputDir = input.prompt(
+            "Recording output directory",
+            defaultValue: config.recordings.outputDir
+        )
+
+        review(config: config, paths: paths, includeOptionalFeatures: true)
+        guard input.confirm(prompt: "Save this configuration?", defaultValue: true) else {
+            print("Canceled. No changes were written.")
+            return
+        }
+        try ConfigWriter.write(config: config, paths: paths, secretUpdates: [:])
+        print("Configuration saved: \(paths.configURL.path)")
+    }
+
     static func runConfigMenu(configPath: URL?) throws {
         let input = WizardInput()
         printHeader("Local Audio Config")
         let choice = input.choose(
             prompt: "What would you like to do?",
             options: [
-                "Edit configuration",
+                "Edit core setup",
+                "Edit optional features",
                 "Show configuration",
                 "Run doctor",
                 "Hard reset to safe defaults",
@@ -93,10 +96,12 @@ enum ConfigWizard {
         )
         switch choice {
         case 1:
-            try show(configPath: configPath)
+            try runOptionalFeaturesEditor(configPath: configPath)
         case 2:
-            try doctor(configPath: configPath)
+            try show(configPath: configPath)
         case 3:
+            try doctor(configPath: configPath)
+        case 4:
             guard input.confirm(prompt: "Reset config and local secrets?", defaultValue: false) else {
                 print("Canceled. No changes were written.")
                 return
@@ -139,21 +144,18 @@ enum ConfigWizard {
         print("ASR: \(config.asr.modelVersion), language \(asrLanguageSummary(config.asr.language))")
         print("Audio input: \(audioInputSummary(config.audioInput))")
         print("Paste shortcut: \(config.hotkeys.paste.displayName)")
-        print("Dump shortcut: \(config.hotkeys.dump.displayName)")
+        print("Control + Option shortcut: \(config.hotkeys.dump.displayName)")
+        print("Control + Option mode: \(config.controlOptionMode.displayName)")
         print("Bluetooth shortcut: \(config.hotkeys.bluetooth.isEnabled ? config.hotkeys.bluetooth.displayName : "disabled")")
-        print("Hermes Agent: \(hermesSummary(config.hermesAgent, hotkeys: config.hotkeys))")
+        print("Hermes Agent: \(hermesSummary(config))")
         let bluetoothOutput = config.hotkeys.bluetooth.isEnabled
             ? config.llmOutput.bluetooth.rawValue
             : "\(config.llmOutput.bluetooth.rawValue) (inactive)"
         print("Outputs: paste=\(config.llmOutput.paste.rawValue), dump=\(config.llmOutput.dump.rawValue), bluetooth=\(bluetoothOutput)")
-        print("Command LLM: \(llmSummary(config.localLLM))")
-        if config.localLLM.apiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            print("API key: not configured")
-        } else {
-            print("API key \(config.localLLM.apiKeyEnv): \(masked(config.localLLM.resolvedAPIKey))")
-        }
+        print("Command LLM: \(providerSummary(config.commandProvider))")
+        print("API key \(config.commandProvider.apiKeyEnvironmentName): \(masked(config.commandProvider.resolveAPIKey(configURL: paths.configURL)))")
+        print("Screen Recording permission: \(CGPreflightScreenCaptureAccess() ? "granted" : "missing (text-only fallback remains available)")")
         print("Daily note: \(config.dump.markdownURL.path)")
-        print("Skills: \(config.skills.directoryURL.path)")
     }
 
     static func doctor(configPath: URL?) throws {
@@ -201,29 +203,23 @@ enum ConfigWizard {
             ))
         }
 
-        if config.localLLM.canGenerateCommands, config.localLLM.provider != .mlx {
-            let apiKeyEnv = config.localLLM.apiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
-            if apiKeyEnv.isEmpty {
-                checks.append(.init(
-                    name: "Command LLM API key",
-                    passed: true,
-                    detail: "not configured; requests are sent without Authorization"
-                ))
-            } else {
-                checks.append(.init(
-                    name: "Command LLM API key",
-                    passed: !config.localLLM.resolvedAPIKey.isEmpty,
-                    detail: "\(apiKeyEnv) in environment or \(config.localLLM.dotenvFile)"
-                ))
-            }
-            checks.append(.init(
-                name: "Chat completions URL",
-                passed: config.localLLM.chatCompletionsURL != nil,
-                detail: config.localLLM.chatCompletionsURL?.absoluteString ?? "missing"
-            ))
-        }
+        checks.append(.init(
+            name: "Command provider",
+            passed: true,
+            detail: providerSummary(config.commandProvider)
+        ))
+        checks.append(.init(
+            name: "Control + Option mode",
+            passed: true,
+            detail: config.controlOptionMode.displayName
+        ))
+        checks.append(.init(
+            name: "\(config.commandProvider.displayName) API key",
+            passed: !config.commandProvider.resolveAPIKey(configURL: paths.configURL).isEmpty,
+            detail: "\(config.commandProvider.apiKeyEnvironmentName) in environment or \(paths.dotenvURL.path)"
+        ))
 
-        if config.hermesAgent.enabled {
+        if config.controlOptionMode == .hermes {
             let executable = hermesExecutableCheck(config.hermesAgent.executable)
             checks.append(.init(
                 name: "Hermes executable",
@@ -239,16 +235,13 @@ enum ConfigWizard {
             }
         }
 
-        checks.append(.init(
-            name: "Skills directory",
-            passed: fileManager.fileExists(atPath: config.skills.directoryURL.path),
-            detail: config.skills.directoryURL.path
-        ))
-        checks.append(.init(
-            name: "Daily note directory",
-            passed: fileManager.fileExists(atPath: config.dump.markdownURL.deletingLastPathComponent().path),
-            detail: config.dump.markdownURL.deletingLastPathComponent().path
-        ))
+        if config.controlOptionMode == .dump || config.continuousDump.enabled {
+            checks.append(.init(
+                name: "Daily note directory",
+                passed: fileManager.fileExists(atPath: config.dump.markdownURL.deletingLastPathComponent().path),
+                detail: config.dump.markdownURL.deletingLastPathComponent().path
+            ))
+        }
 
         let activeBluetoothOutput =
             config.llmOutput.paste == .bluetoothKeyboard
@@ -272,7 +265,7 @@ enum ConfigWizard {
         checks.append(.init(
             name: "Screen Recording permission",
             passed: CGPreflightScreenCaptureAccess(),
-            detail: "Required for Hermes screenshot context"
+            detail: "Required for command screenshot context"
         ))
 
         printHeader("Local Audio Doctor")
@@ -283,21 +276,28 @@ enum ConfigWizard {
 
     private static func loadWizardBaseConfig(paths: ConfigPaths) throws -> AppConfig {
         let fileManager = FileManager.default
-        let sourceURL = fileManager.fileExists(atPath: paths.configURL.path)
+        let configExists = fileManager.fileExists(atPath: paths.configURL.path)
+        let sourceURL = configExists
             ? paths.configURL
             : AppConfig.repositoryRootURL.appendingPathComponent("config/config.json")
         var config = try AppConfig.load(from: sourceURL)
-        config.promptConfigFile = "promptConfig.json"
-        config.textReplacementsFile = "textReplacements.json"
-        config.localLLM.dotenvFile = ".env"
-        config.skills.directory = AppConfig.repositoryRootURL.appendingPathComponent("skills").path
-        normalizeInstallLocalDefaults(&config)
+        if configExists {
+            config.asr.language = AsrLanguageResolver.normalizePreference(config.asr.language)
+        } else {
+            normalizeInstallLocalDefaults(&config)
+        }
         return config
     }
 
     private static func freshDefaultConfig() -> AppConfig {
         var config = AppConfig()
-        applySimpleSetup(to: &config)
+        config.hotkeys.dump = HotkeyConfig(control: true, option: true, command: false, shift: false)
+        config.hotkeys.bluetooth = KeyChordConfig(keys: [], enabled: false)
+        config.controlOptionMode = .dump
+        config.llmOutput.dump = .dump
+        config.llmOutput.bluetooth = .clipboard
+        config.dump.enabled = true
+        config.continuousDump.enabled = false
         normalizeInstallLocalDefaults(&config)
         return config
     }
@@ -307,47 +307,10 @@ enum ConfigWizard {
         config.textReplacementsFile = "textReplacements.json"
         config.audioInput = AudioInputConfig()
         config.asr.language = AsrLanguageResolver.normalizePreference(config.asr.language)
-        config.localLLM.dotenvFile = ".env"
-        config.localLLM.requestTimeoutSeconds = 15
-        config.localLLM.maxRetries = 1
-        config.localLLM.cacheSize = 4096
-        config.localLLM.memorySize = 4096
         config.dump.markdownFile = defaultDailyNotePath
-        config.skills.directory = AppConfig.repositoryRootURL.appendingPathComponent("skills").path
         config.hermesAgent.workdir = "~"
         config.bluetoothKeyboard.port = nil
         config.bluetoothKeyboard.chunkSize = 32
-    }
-
-    private static func applySimpleSetup(to config: inout AppConfig) {
-        config.localLLM.enabled = true
-        config.localLLM.commandGenerationEnabled = true
-        config.localLLM.provider = .openAICompatible
-        config.localLLM.model = defaultOpenAIModel
-        config.localLLM.endpoint = ""
-        config.localLLM.baseURL = defaultOpenAIBaseURL
-        config.localLLM.apiKeyEnv = defaultOpenAIAPIKeyEnv
-        config.localLLM.temperature = 0
-        config.localLLM.topP = nil
-        config.localLLM.maxTokens = 128
-        config.localLLM.imageContextEnabled = false
-        config.asr.modelVersion = "v3"
-        config.asr.language = AsrLanguageResolver.systemPreference
-        config.hotkeys.paste = HotkeyConfig(control: false, option: true, command: true, shift: false)
-        config.hotkeys.dump = HotkeyConfig(control: true, option: true, command: false, shift: false)
-        config.hotkeys.bluetooth = KeyChordConfig(keys: [], enabled: false)
-        config.llmOutput.paste = .clipboard
-        config.llmOutput.dump = .clipboard
-        config.llmOutput.bluetooth = .clipboard
-        config.dump.enabled = false
-        config.continuousDump.enabled = false
-        config.hermesAgent.enabled = false
-    }
-
-    private static func applyAdvancedSetup(to config: inout AppConfig) {
-        config.dump.enabled = true
-        config.continuousDump.enabled = true
-        config.llmOutput.dump = .dump
     }
 
     private static func configureASR(config: inout AppConfig, input: WizardInput) {
@@ -409,146 +372,60 @@ enum ConfigWizard {
         }
     }
 
-    private static func configureCommandLLM(
-        config: inout AppConfig,
-        input: WizardInput,
-        secretUpdates: inout [String: String]
-    ) {
+    private static func configureCommandProvider(config: inout AppConfig, input: WizardInput) {
+        let providers: [CommandProvider] = [.openAI, .cerebras]
+        let defaultIndex = providers.firstIndex(of: config.commandProvider) ?? 0
         let choice = input.choose(
-            prompt: "Choose command LLM provider",
+            prompt: "Choose command provider",
             options: [
-                "Cerebras Gemma-4-31B",
-                "OpenAI-compatible API",
-                "Azure DeepSeek-V4-Flash",
-                "Local MLX/Bonsai",
-                "Disabled",
+                "OpenAI — gpt-5.6-luna, low reasoning, low-detail screenshots",
+                "Cerebras — gemma-4-31b",
             ],
-            defaultIndex: 0
+            defaultIndex: defaultIndex
         )
-
-        switch choice {
-        case 0:
-            applyCerebras(to: &config)
-            configureRemoteToken(config: &config, input: input, secretUpdates: &secretUpdates)
-        case 1:
-            configureOpenAICompatible(config: &config, input: input, secretUpdates: &secretUpdates)
-        case 2:
-            config.localLLM.enabled = true
-            config.localLLM.commandGenerationEnabled = true
-            config.localLLM.provider = .azureOpenAI
-            config.localLLM.model = "DeepSeek-V4-Flash"
-            config.localLLM.endpoint = defaultAzureEndpoint
-            config.localLLM.baseURL = ""
-            config.localLLM.apiKeyEnv = "AZURE_OPENAI_API_KEY"
-            config.localLLM.topP = nil
-            config.localLLM.imageContextEnabled = false
-            configureRemoteToken(config: &config, input: input, secretUpdates: &secretUpdates)
-        case 3:
-            config.localLLM.enabled = true
-            config.localLLM.commandGenerationEnabled = true
-            config.localLLM.provider = .mlx
-            config.localLLM.model = input.prompt(
-                "MLX model",
-                defaultValue: "prism-ml/Ternary-Bonsai-8B-mlx-2bit"
-            )
-            config.localLLM.llmTool = input.prompt("llm-tool path", defaultValue: config.localLLM.llmTool)
-            config.localLLM.mlxRun = input.prompt("mlx-run path", defaultValue: config.localLLM.mlxRun)
-            config.localLLM.download = input.prompt("Model download/cache path", defaultValue: config.localLLM.download)
-            config.localLLM.topP = nil
-            config.localLLM.imageContextEnabled = false
-        case 4:
-            config.localLLM.enabled = false
-            config.localLLM.commandGenerationEnabled = false
-            config.localLLM.imageContextEnabled = false
-        default:
-            configureOpenAICompatible(config: &config, input: input, secretUpdates: &secretUpdates)
-        }
+        config.commandProvider = providers[choice]
     }
 
-    private static func applyCerebras(to config: inout AppConfig) {
-        config.localLLM.enabled = true
-        config.localLLM.commandGenerationEnabled = true
-        config.localLLM.provider = .cerebras
-        config.localLLM.model = defaultCerebrasModel
-        config.localLLM.endpoint = ""
-        config.localLLM.baseURL = defaultCerebrasBaseURL
-        config.localLLM.apiKeyEnv = defaultCerebrasAPIKeyEnv
-        config.localLLM.temperature = defaultCerebrasTemperature
-        config.localLLM.topP = defaultCerebrasTopP
-        config.localLLM.maxTokens = defaultCerebrasMaxTokens
-        config.localLLM.imageContextEnabled = true
-        config.localLLM.requestTimeoutSeconds = 30
-    }
-
-    private static func configureOpenAICompatible(
-        config: inout AppConfig,
-        input: WizardInput,
-        secretUpdates: inout [String: String],
-        choosePreset: Bool = true
-    ) {
-        let defaults: (baseURL: String, model: String, apiKeyEnv: String)
-        if choosePreset {
-            let preset = input.choose(
-                prompt: "OpenAI-compatible API preset",
-                options: [
-                    "OpenAI API",
-                    "OpenRouter",
-                    "Groq",
-                    "Local LM Studio",
-                    "Custom",
-                ],
-                defaultIndex: 0
-            )
-
-            switch preset {
-            case 1:
-                defaults = ("https://openrouter.ai/api/v1", "openai/gpt-5.4-mini", defaultOpenAIAPIKeyEnv)
-            case 2:
-                defaults = ("https://api.groq.com/openai/v1", "openai/gpt-oss-20b", defaultOpenAIAPIKeyEnv)
-            case 3:
-                defaults = ("http://localhost:1234/v1", "local-model", "")
-            case 4:
-                defaults = ("https://api.example.com/v1", "", defaultOpenAIAPIKeyEnv)
-            default:
-                defaults = (defaultOpenAIBaseURL, defaultOpenAIModel, defaultOpenAIAPIKeyEnv)
-            }
-        } else {
-            defaults = (defaultOpenAIBaseURL, defaultOpenAIModel, defaultOpenAIAPIKeyEnv)
-        }
-
-        config.localLLM.enabled = true
-        config.localLLM.commandGenerationEnabled = true
-        config.localLLM.provider = .openAICompatible
-        config.localLLM.endpoint = ""
-        config.localLLM.baseURL = input.prompt("Base URL without /chat/completions", defaultValue: defaults.baseURL)
-        config.localLLM.temperature = 0
-        config.localLLM.topP = nil
-        config.localLLM.maxTokens = 128
-        config.localLLM.imageContextEnabled = false
-        if defaults.model.isEmpty {
-            config.localLLM.model = input.promptRequired("Model name/slug")
-        } else {
-            config.localLLM.model = input.prompt("Model name/slug", defaultValue: defaults.model)
-        }
-        config.localLLM.apiKeyEnv = input.prompt(
-            "API key env name, leave empty for local servers without a token",
-            defaultValue: defaults.apiKeyEnv
-        )
-        configureRemoteToken(config: &config, input: input, secretUpdates: &secretUpdates)
-    }
-
-    private static func configureRemoteToken(
-        config: inout AppConfig,
+    private static func configureProviderKey(
+        config: AppConfig,
         input: WizardInput,
         secretUpdates: inout [String: String]
     ) {
-        let envName = config.localLLM.apiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !envName.isEmpty else {
-            return
-        }
-        let token = input.secret("API token for \(envName) (leave blank to keep current)")
+        let provider = config.commandProvider
+        let token = input.secret(
+            "\(provider.displayName) API key for \(provider.apiKeyEnvironmentName) (hidden; leave blank to keep current)"
+        )
         if !token.isEmpty {
-            secretUpdates[envName] = token
+            secretUpdates[provider.apiKeyEnvironmentName] = token
+        }
+    }
+
+    private static func configureControlOptionMode(config: inout AppConfig, input: WizardInput) {
+        let modes: [ControlOptionMode] = [.dump, .hermes]
+        let defaultIndex = modes.firstIndex(of: config.controlOptionMode) ?? 0
+        let choice = input.choose(
+            prompt: "Choose Control + Option mode",
+            options: [
+                "Markdown Dump — transcript and optional P screenshots",
+                "Hermes Agent — one spoken instruction and optional P screenshots",
+            ],
+            defaultIndex: defaultIndex
+        )
+        config.controlOptionMode = modes[choice]
+        if config.controlOptionMode == .dump {
+            config.dump.enabled = true
+            config.llmOutput.dump = .dump
+            configureDailyNote(config: &config, input: input)
+        }
+    }
+
+    private static func explainScreenRecording(input: WizardInput) {
+        print("")
+        print("Command, Markdown Dump, and Hermes modes can include up to five full-desktop screenshots captured explicitly with P.")
+        print("macOS will ask for Screen Recording permission when screenshot context is used. Without permission, every mode continues with text only.")
+        if !CGPreflightScreenCaptureAccess(), isatty(STDIN_FILENO) == 1,
+           input.confirm(prompt: "Request Screen Recording permission now?", defaultValue: true) {
+            _ = CGRequestScreenCaptureAccess()
         }
     }
 
@@ -560,8 +437,7 @@ enum ConfigWizard {
         )
     }
 
-    private static func configureShortcuts(config: inout AppConfig, input: WizardInput) {
-        configurePasteShortcut(config: &config, input: input)
+    private static func configureDumpShortcut(config: inout AppConfig, input: WizardInput) {
         config.hotkeys.dump = chooseModifierShortcut(
             label: "Dump Shortcut",
             input: input,
@@ -606,15 +482,10 @@ enum ConfigWizard {
     }
 
     private static func configureHermesAgent(config: inout AppConfig, input: WizardInput) {
-        print("\nHermes Agent Trigger: \(hermesTriggerSummary(config.hotkeys))")
-        let enabled = input.confirm(
-            prompt: "Enable Hermes Agent?",
-            defaultValue: config.hermesAgent.enabled
-        )
-        config.hermesAgent.enabled = enabled
-        guard enabled else {
+        guard config.controlOptionMode == .hermes else {
             return
         }
+        print("\nHermes Agent Trigger: \(hermesTriggerSummary(config.hotkeys))")
 
         guard input.confirm(prompt: "Customize Hermes Agent details?", defaultValue: false) else {
             return
@@ -693,7 +564,11 @@ enum ConfigWizard {
 
     private static func configureOutputs(config: inout AppConfig, input: WizardInput) {
         config.llmOutput.paste = chooseOutput(label: "Paste Output", input: input, defaultMethod: config.llmOutput.paste)
-        config.llmOutput.dump = chooseOutput(label: "Dump Output", input: input, defaultMethod: config.llmOutput.dump)
+        if config.controlOptionMode == .dump {
+            config.llmOutput.dump = .dump
+        } else {
+            config.llmOutput.dump = chooseOutput(label: "Dump Output", input: input, defaultMethod: config.llmOutput.dump)
+        }
         if !config.hotkeys.bluetooth.isEnabled {
             config.llmOutput.bluetooth = .clipboard
         } else {
@@ -722,19 +597,18 @@ enum ConfigWizard {
         path.contains("OneDrive-Personal/Obsidian/") && path.contains("Daily Notes/")
     }
 
-    private static func review(config: AppConfig, paths: ConfigPaths, includeAdvanced: Bool) {
+    private static func review(config: AppConfig, paths: ConfigPaths, includeOptionalFeatures: Bool) {
         printHeader("Review")
         print("Config: \(paths.configURL.path)")
         print("ASR language: \(asrLanguageSummary(config.asr.language))")
-        print("Command LLM: \(llmSummary(config.localLLM))")
+        print("Command LLM: \(providerSummary(config.commandProvider))")
         print("Paste shortcut: \(config.hotkeys.paste.displayName) -> \(config.llmOutput.paste.rawValue)")
-        if includeAdvanced {
-            print("Dump shortcut: \(config.hotkeys.dump.displayName) -> \(config.llmOutput.dump.rawValue)")
+        print("Control + Option: \(config.hotkeys.dump.displayName) -> \(config.controlOptionMode.displayName)")
+        if includeOptionalFeatures {
             print("Bluetooth: \(config.hotkeys.bluetooth.isEnabled ? config.hotkeys.bluetooth.displayName : "disabled") -> \(config.llmOutput.bluetooth.rawValue)")
-            print("Hermes Agent: \(hermesSummary(config.hermesAgent, hotkeys: config.hotkeys))")
+            print("Hermes Agent: \(hermesSummary(config))")
             print("Daily note: \(config.dump.markdownFile)")
         }
-        print("Skills: \(config.skills.directory)")
         print("Secret file: \(paths.dotenvURL.path)")
     }
 
@@ -753,35 +627,25 @@ enum ConfigWizard {
         AsrLanguageResolver.resolve(language).displayValue
     }
 
-    private static func llmSummary(_ config: LocalLLMConfig) -> String {
-        guard config.canGenerateCommands else {
-            return "disabled"
-        }
-        switch config.provider {
-        case .azureOpenAI:
-            return "Azure OpenAI \(config.model) @ \(config.endpoint)\(imageContextSummary(config))"
-        case .openAICompatible:
-            return "OpenAI-compatible \(config.model) @ \(config.chatCompletionsURL?.absoluteString ?? config.baseURL)\(imageContextSummary(config))"
+    private static func providerSummary(_ provider: CommandProvider) -> String {
+        switch provider {
+        case .openAI:
+            return "OpenAI Responses \(OpenAISecrets.model), reasoning=\(OpenAISecrets.reasoningEffort), screenshots=up to 5, detail=\(OpenAISecrets.imageDetail)"
         case .cerebras:
-            return "Cerebras \(config.model) @ \(config.chatCompletionsURL?.absoluteString ?? config.baseURL)\(imageContextSummary(config))"
-        case .mlx:
-            return "MLX \(config.model)\(imageContextSummary(config))"
+            return "Cerebras Chat Completions \(CerebrasSecrets.model), screenshots=up to 5"
         }
     }
 
-    private static func imageContextSummary(_ config: LocalLLMConfig) -> String {
-        config.imageContextEnabled ? " + image context" : ""
-    }
-
-    private static func hermesSummary(_ config: HermesAgentConfig, hotkeys: HotkeysConfig) -> String {
-        guard config.enabled else {
-            return "disabled"
+    private static func hermesSummary(_ config: AppConfig) -> String {
+        guard config.controlOptionMode == .hermes else {
+            return "inactive"
         }
-        return "enabled, trigger=\(hermesTriggerSummary(hotkeys)), executable=\(config.executable), session=\(config.sessionName), workdir=\(config.workdir)"
+        let agent = config.hermesAgent
+        return "active, trigger=\(hermesTriggerSummary(config.hotkeys)), executable=\(agent.executable), session=\(agent.sessionName), workdir=\(agent.workdir)"
     }
 
     private static func hermesTriggerSummary(_ hotkeys: HotkeysConfig) -> String {
-        "hold \(hotkeys.paste.displayName), release Command, keep holding Option"
+        "hold \(hotkeys.dump.displayName), speak once, release either modifier"
     }
 
     private static func masked(_ value: String) -> String {

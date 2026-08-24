@@ -34,6 +34,24 @@ def main() -> int:
             "confirmContinuation(for action: HotkeyAction)",
             "confirmed command-mode transition must be isolated",
         ),
+        ("screenshotTasks: [Task<URL?, Never>]", "command state must carry zero to five ordered screenshot tasks"),
+        ("RecordingRoutePolicy.providerImages", "provider image routing must distinguish paste and Dump commands"),
+        (
+            "command segment was empty or invalid; using information transcript",
+            "empty command recording must fall back to the information transcript",
+        ),
+        (
+            "cleanupCommandScreenshotTasks",
+            "temporary command screenshots must be removed on every exit path",
+        ),
+        (
+            "cleanupStaleScreenContexts()",
+            "startup must purge orphaned command screenshots",
+        ),
+        (
+            "cleanup failed:",
+            "screenshot cleanup failures must be visible",
+        ),
     ]
 
     failed = False

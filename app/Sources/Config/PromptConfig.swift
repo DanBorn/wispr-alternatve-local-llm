@@ -37,21 +37,16 @@ struct PromptConfig: Decodable {
         guard !coreCommand.userTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CliError.invalidValue("prompt config core_command.user_template must not be empty")
         }
-        guard !coreCommand.userTemplateWithSkillContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw CliError.invalidValue("prompt config core_command.user_template_with_skill_context must not be empty")
-        }
     }
 }
 
 struct CoreCommandPromptConfig: Decodable {
     var system = ""
     var userTemplate = ""
-    var userTemplateWithSkillContext = ""
 
     enum CodingKeys: String, CodingKey {
         case system
         case userTemplate = "user_template"
-        case userTemplateWithSkillContext = "user_template_with_skill_context"
     }
 
     init() {}
@@ -60,9 +55,6 @@ struct CoreCommandPromptConfig: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         system = try container.decodePromptStringIfPresent(forKey: .system) ?? system
         userTemplate = try container.decodePromptStringIfPresent(forKey: .userTemplate) ?? userTemplate
-        userTemplateWithSkillContext = try container.decodePromptStringIfPresent(
-            forKey: .userTemplateWithSkillContext
-        ) ?? userTemplateWithSkillContext
     }
 }
 

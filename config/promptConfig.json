@@ -2,7 +2,6 @@
   "core_command": {
     "system": [
       "Transform Information according to Task.",
-      "Use Tool output if present.",
       "Keep answers concise and complete.",
       "Use at most two short sentences unless the task asks for more.",
       "Keep the language the user spoke unless the user says reply in a different language.",
@@ -14,16 +13,6 @@
       "",
       "Text:",
       "{{information}}"
-    ],
-    "user_template_with_skill_context": [
-      "Do:",
-      "{{command}}",
-      "",
-      "Text:",
-      "{{information}}",
-      "",
-      "Context:",
-      "{{skill_context}}"
     ]
   }
 }

@@ -27,5 +27,10 @@ let package = Package(
             ],
             path: "Sources"
         ),
+        .testTarget(
+            name: "FluidPushToTalkTests",
+            dependencies: ["FluidPushToTalk"],
+            path: "Tests"
+        ),
     ]
 )

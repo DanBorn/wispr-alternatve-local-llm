@@ -1,9 +1,10 @@
 {
   "prompt_config_file": "promptConfig.json",
   "text_replacements_file": "textReplacements.json",
+  "command_provider": "openai",
+  "control_option_mode": "dump",
   "debug": {
-    "enabled": false,
-    "log_llm_requests": false
+    "enabled": false
   },
   "asr": {
     "model_version": "v3",
@@ -42,7 +43,7 @@
     "output_dir": "recordings"
   },
   "dump": {
-    "enabled": false,
+    "enabled": true,
     "markdown_file": "~/Documents/Obsidian/Daily Notes/YYYY-MM-DD.md",
     "append": true,
     "include_timestamp": true
@@ -52,46 +53,17 @@
   },
   "llm_output": {
     "paste": "clipboard",
-    "dump": "clipboard",
+    "dump": "dump",
     "bluetooth": "clipboard"
   },
   "bluetooth_keyboard": {
     "port": null,
     "chunk_size": 32
   },
-  "skills": {
-    "enabled": true,
-    "directory": "skills",
-    "max_selected": 2,
-    "minimum_score": 2
-  },
-  "local_llm": {
-    "enabled": true,
-    "command_generation_enabled": true,
-    "provider": "openai_compatible",
-    "mlx_run": "mlx-run",
-    "llm_tool": "llm-tool",
-    "download": "~/Library/Application Support/FluidPushToTalk/Models",
-    "model": "gpt-5.4-mini",
-    "endpoint": "",
-    "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY",
-    "temperature": 0,
-    "top_p": null,
-    "max_tokens": 128,
-    "image_context_enabled": false,
-    "cache_size": 4096,
-    "memory_size": 4096,
-    "timeout_seconds": 30,
-    "request_timeout_seconds": 15,
-    "max_retries": 1,
-    "dotenv_file": ".env"
-  },
   "audio_ducking": {
     "enabled": true
   },
   "hermes_agent": {
-    "enabled": false,
     "executable": "hermes",
     "session_name": "local-audio-voice-agent",
     "workdir": "~",
